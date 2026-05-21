@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+asyncpg==0.30.0
+pyjwt[crypto]==2.10.1
+pydantic==2.10.3
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+httpx==0.28.1
+
+# ── Worker / Scraper ──
+pandas==2.2.3
+playwright==1.49.0
