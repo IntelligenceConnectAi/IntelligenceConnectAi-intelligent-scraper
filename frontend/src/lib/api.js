@@ -31,6 +31,7 @@ async function apiFetch(path, options = {}) {
 export const api = {
   // Auth
   me:             ()           => apiFetch("/auth/me"),
+  updateProfile:  (data)       => apiFetch("/auth/profile", { method: "PATCH", body: JSON.stringify(data) }),
 
   // Plans
   plans:          ()           => apiFetch("/plans"),
@@ -45,6 +46,8 @@ export const api = {
   getJob:         (id)         => apiFetch(`/jobs/${id}`),
   cancelJob:      (id)         => apiFetch(`/jobs/${id}/cancel`, { method: "POST" }),
   downloadJob:    (id, type)   => apiFetch(`/jobs/${id}/download/${type}`),
+
+  // Billing
+  createCheckout: (price_id)   => apiFetch("/billing/checkout", { method: "POST", body: JSON.stringify({ price_id }) }),
+  getBillingPortal: ()         => apiFetch("/billing/portal"),
 };
-// Profile update — added for Settings name field
-api.updateProfile = (data) => apiFetch("/auth/profile", { method: "PATCH", body: JSON.stringify(data) });
