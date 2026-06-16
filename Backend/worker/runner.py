@@ -493,6 +493,7 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_SITES)
     total = len(df)
     done  = [0]
+    records = df.to_dict("records")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -500,17 +501,22 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
             slow_mo=0,
             args=CHROMIUM_ARGS,
         )
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-        )
-
-        records = df.to_dict("records")
 
         async def process_one(row):
             if not str(row.get("Website", "")).strip(): return
             async with semaphore:
-                row["Email"] = await _crawl_site_for_email(context, row["Website"])
+                ctx = await browser.new_context(
+                    viewport={"width": 1280, "height": 900},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+                )
+                try:
+                    row["Email"] = await _crawl_site_for_email(ctx, row["Website"])
+                except Exception as e:
+                    print(f"[RUNNER] Email crawl error: {e}")
+                    row["Email"] = ""
+                finally:
+                    try: await ctx.close()
+                    except: pass
                 done[0] += 1
                 if done[0] % 10 == 0 or done[0] == total:
                     found = sum(1 for r in records if r.get("Email"))
@@ -519,15 +525,11 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                                       emails_found=found)
 
         await asyncio.gather(*[process_one(r) for r in records if str(r.get("Website","")).strip()])
-        await context.close()
         await browser.close()
 
     return pd.DataFrame(records)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  MAIN ENTRY POINT
-# ═══════════════════════════════════════════════════════════════
 async def run_scrape_job(
     *,
     job_id: str,
