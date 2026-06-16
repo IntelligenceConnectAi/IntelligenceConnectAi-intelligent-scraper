@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     supabase_service_role_key: str
     supabase_jwt_secret: str
     database_url: str
-    cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
+    cors_origins: str = "http://localhost:5173"
     debug: bool = False
 
     # Stripe
@@ -22,6 +22,18 @@ class Settings(BaseSettings):
     stripe_starter_price_id: str = ""
     stripe_pro_price_id: str = ""
     stripe_elite_price_id: str = ""
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """Parse cors_origins — supports both comma-separated and JSON array."""
+        import json
+        val = self.cors_origins.strip()
+        if val.startswith("["):
+            try:
+                return json.loads(val)
+            except Exception:
+                pass
+        return [v.strip() for v in val.split(",") if v.strip()]
 
 
 settings = Settings()
