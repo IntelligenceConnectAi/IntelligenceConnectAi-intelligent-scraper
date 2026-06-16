@@ -28,5 +28,3 @@ COPY app/    ./app/
 COPY worker/ ./worker/
 
 CMD ["python", "-m", "worker.main"]
-
-RUN playwright install-deps chromium
