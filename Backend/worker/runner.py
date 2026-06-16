@@ -198,26 +198,71 @@ async def _scroll_to_end(page):
 async def _extract_cards(page):
     data = await page.evaluate("""
         () => {
-            const phoneRegex = /(\\(?\\d{3}\\)?[\\s\\-\\.]?\\d{3}[\\s\\-\\.]?\\d{4})/;
-            const addressKeywords = [' St',' St,',' Ave',' Ave,',' Rd',' Rd,',' Blvd',' Dr',' Dr,',' Ln',' Ln,',' Way',' Ct',' Ct,',' Pl',' Pl,',' Hwy',' Pkwy',' Suite',' #',' Ste'];
-            function looksLikeAddress(txt) { if (!txt || txt.length < 5) return false; return /\\d/.test(txt) && addressKeywords.some(kw => txt.includes(kw)); }
-            function looksLikePhone(txt) { if (!txt) return false; const m = txt.match(phoneRegex); return m ? m[0] : null; }
-            function isJunk(txt) { if (!txt) return true; const lower = txt.toLowerCase(); return /open|closed|hours/.test(lower) || txt.length < 5; }
             const results = [];
-            document.querySelectorAll('div[role="feed"] > div > div[jsaction]').forEach(card => {
+            const cards = document.querySelectorAll('div[role="feed"] > div > div[jsaction]');
+            cards.forEach(card => {
                 const row = { name:'', category:'', rating:'', reviews:'', address:'', phone:'', website:'', maps_url:'' };
-                const nameEl = card.querySelector('.qBF1Pd'); if (nameEl) row.name = nameEl.innerText.trim(); if (!row.name) return;
-                const catEl = card.querySelector('.W4Efsd .W4Efsd span'); if (catEl) row.category = catEl.innerText.trim();
-                const ratingEl = card.querySelector('.MW4etd'); if (ratingEl) row.rating = ratingEl.innerText.trim();
-                const revEl = card.querySelector('.UY7F9'); if (revEl) row.reviews = revEl.innerText.replace(/[()]/g,'').trim();
-                const webEl = card.querySelector('a[data-value="Website"]'); if (webEl) row.website = webEl.href || '';
-                const mapsEl = card.querySelector('a.hfpxzc'); if (mapsEl) row.maps_url = mapsEl.href || '';
+
+                // Name: try aria-label on main link first (most stable)
+                const mainLink = card.querySelector('a.hfpxzc');
+                if (mainLink) {
+                    row.maps_url = mainLink.href || '';
+                    const label = mainLink.getAttribute('aria-label') || '';
+                    if (label) row.name = label.trim();
+                }
+                // Fallback name selectors
+                if (!row.name) {
+                    const nameSelectors = ['.qBF1Pd', '[class*="fontHeadlineSmall"]', 'h3', 'h2'];
+                    for (const sel of nameSelectors) {
+                        const el = card.querySelector(sel);
+                        if (el && el.innerText && el.innerText.trim().length > 1) {
+                            row.name = el.innerText.trim();
+                            break;
+                        }
+                    }
+                }
+                if (!row.name) return;
+
+                // Website
+                const webEl = card.querySelector('a[data-value="Website"], a[data-item-id="authority"]');
+                if (webEl) row.website = webEl.href || '';
+
+                // Rating
+                const ratingEl = card.querySelector('.MW4etd');
+                if (ratingEl) row.rating = ratingEl.innerText.trim();
+                if (!row.rating) {
+                    card.querySelectorAll('[aria-label]').forEach(el => {
+                        const lb = el.getAttribute('aria-label') || '';
+                        const m = lb.match(/([\\d.]+)\\s+star/i);
+                        if (m && !row.rating) row.rating = m[1];
+                    });
+                }
+
+                // Reviews
+                const revEl = card.querySelector('.UY7F9');
+                if (revEl) row.reviews = revEl.innerText.replace(/[()]/g,'').trim();
+
+                // Address & Phone from aria-labels
                 card.querySelectorAll('[aria-label]').forEach(el => {
                     const label = (el.getAttribute('aria-label') || '').trim();
-                    if (/^Address[:\\s]/i.test(label) && !row.address) { const addr = label.replace(/^Address[:\\s]*/i,'').trim(); if (!isJunk(addr)) row.address = addr; }
-                    if (/^Phone[:\\s]/i.test(label) && !row.phone) row.phone = label.replace(/^Phone[:\\s]*/i,'').trim();
+                    if (/^Address[:\\s]/i.test(label) && !row.address) {
+                        row.address = label.replace(/^Address[:\\s]*/i,'').trim();
+                    }
+                    if (/^Phone[:\\s]/i.test(label) && !row.phone) {
+                        row.phone = label.replace(/^Phone[:\\s]*/i,'').trim();
+                    }
                 });
-                if (!row.phone) { const telEl = card.querySelector('a[href^="tel:"]'); if (telEl) row.phone = telEl.href.replace('tel:','').trim(); }
+
+                // Phone fallback
+                if (!row.phone) {
+                    const telEl = card.querySelector('a[href^="tel:"]');
+                    if (telEl) row.phone = telEl.href.replace('tel:','').trim();
+                }
+
+                // Category from text
+                const catEl = card.querySelector('.W4Efsd .W4Efsd span, [class*="fontBodyMedium"] span');
+                if (catEl) row.category = catEl.innerText.trim();
+
                 results.push(row);
             });
             return results;
@@ -227,11 +272,11 @@ async def _extract_cards(page):
     for r in data:
         if not r.get("name"): continue
         rows.append({
-            "Name": r["name"], "Category": r["category"],
-            "Rating": r["rating"], "Reviews": r["reviews"],
+            "Name": r["name"], "Category": r.get("category", ""),
+            "Rating": r.get("rating", ""), "Reviews": r.get("reviews", ""),
             "Address": clean_address(r.get("address", "")),
             "Phone": format_phone(r.get("phone", "")),
-            "Email": "", "Website": r["website"], "Maps_URL": r["maps_url"],
+            "Email": "", "Website": r.get("website", ""), "Maps_URL": r.get("maps_url", ""),
         })
     return rows
 
