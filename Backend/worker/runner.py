@@ -278,6 +278,11 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
             await _update_city(pool, job_id, city, maps_status="done", maps_leads=0)
             return []
 
+        # Debug logging
+        title = await page.title()
+        card_count = await page.locator('div[role="feed"] > div > div[jsaction]').count()
+        print(f"[RUNNER] {city}: title={title}, cards_before_scroll={card_count}")
+
         await _scroll_to_end(page)
         results = await _extract_cards(page)
         print(f"[RUNNER] {city}: found {len(results)} results")
