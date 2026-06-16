@@ -1,11 +1,6 @@
 """
 Intelligent Scraper — Job Runner
 Adapted from scrap.py. Callable by the worker polling loop.
-Key changes:
-  - Config constants → function parameters
-  - print() → async DB progress updates
-  - Local files → temp dir → Supabase Storage
-  - Returns summary dict instead of printing
 """
 
 import asyncio
@@ -23,9 +18,9 @@ import pandas as pd
 from playwright.async_api import async_playwright
 
 # ═══════════════════════════════════════════════════════════════
-#  CONSTANTS (kept from original — not user-configurable)
+#  CONSTANTS
 # ═══════════════════════════════════════════════════════════════
-MAX_CONCURRENT_SITES = 10   # Lower than original for Railway RAM
+MAX_CONCURRENT_SITES = 10
 PAGE_TIMEOUT_MS      = 12000
 FOOTER_WAIT_MS       = 3000
 
@@ -48,9 +43,24 @@ LEGIT_TLDS = {
 }
 EMAIL_REGEX = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Z|a-z]{2,}\b")
 
+# Chromium args for Docker/Railway environment
+CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--no-first-run",
+    "--no-zygote",
+    "--single-process",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--mute-audio",
+]
+
 
 # ═══════════════════════════════════════════════════════════════
-#  HELPERS (unchanged from original)
+#  HELPERS
 # ═══════════════════════════════════════════════════════════════
 def sanitize(name):
     return name.replace(" ", "_").replace("/", "-")
@@ -131,12 +141,8 @@ def select_best_email(emails, website_url):
 #  DB PROGRESS HELPER
 # ═══════════════════════════════════════════════════════════════
 async def _update_job(pool: asyncpg.Pool, job_id: str, **kwargs):
-    """Dynamically update any columns in the jobs table.
-    Pass 'NOW()' string for timestamp fields — auto-converted to datetime.
-    """
     if not kwargs: return
     now = datetime.now(timezone.utc)
-    # Replace "NOW()" string with actual datetime for asyncpg
     resolved = {k: now if v == "NOW()" else v for k, v in kwargs.items()}
     keys = list(resolved.keys())
     set_clauses = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(keys))
@@ -146,7 +152,6 @@ async def _update_job(pool: asyncpg.Pool, job_id: str, **kwargs):
         await conn.execute(sql, now, *values, job_id)
 
 async def _update_city(pool: asyncpg.Pool, job_id: str, city: str, **kwargs):
-    """Update a job_cities row."""
     if not kwargs: return
     now = datetime.now(timezone.utc)
     resolved = {k: now if v == "NOW()" else v for k, v in kwargs.items()}
@@ -175,14 +180,14 @@ async def _scroll_to_end(page):
         html = await page.content()
         if "You've reached the end" in html or "end of the list" in html:
             for _ in range(2):
-                await page.evaluate("() => { const f = document.querySelector('div[role=\"feed\"]'); if (f) f.scrollTop = f.scrollHeight; }")
+                await page.evaluate('() => { const f = document.querySelector(\'div[role="feed"]\'); if (f) f.scrollTop = f.scrollHeight; }')
                 await asyncio.sleep(1.0)
             return await page.locator('div[role="feed"] > div > div[jsaction]').count()
         if cur == prev:
             stable_count += 1
             if stable_count >= 6:
                 for _ in range(3):
-                    await page.evaluate("() => { const f = document.querySelector('div[role=\"feed\"]'); if (f) f.scrollTop = f.scrollHeight; }")
+                    await page.evaluate('() => { const f = document.querySelector(\'div[role="feed"]\'); if (f) f.scrollTop = f.scrollHeight; }')
                     await asyncio.sleep(1.5)
                 final = await page.locator('div[role="feed"] > div > div[jsaction]').count()
                 return final
@@ -193,9 +198,9 @@ async def _scroll_to_end(page):
 async def _extract_cards(page):
     data = await page.evaluate("""
         () => {
-            const phoneRegex = /(\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4})/;
+            const phoneRegex = /(\\(?\\d{3}\\)?[\\s\\-\\.]?\\d{3}[\\s\\-\\.]?\\d{4})/;
             const addressKeywords = [' St',' St,',' Ave',' Ave,',' Rd',' Rd,',' Blvd',' Dr',' Dr,',' Ln',' Ln,',' Way',' Ct',' Ct,',' Pl',' Pl,',' Hwy',' Pkwy',' Suite',' #',' Ste'];
-            function looksLikeAddress(txt) { if (!txt || txt.length < 5) return false; return /\d/.test(txt) && addressKeywords.some(kw => txt.includes(kw)); }
+            function looksLikeAddress(txt) { if (!txt || txt.length < 5) return false; return /\\d/.test(txt) && addressKeywords.some(kw => txt.includes(kw)); }
             function looksLikePhone(txt) { if (!txt) return false; const m = txt.match(phoneRegex); return m ? m[0] : null; }
             function isJunk(txt) { if (!txt) return true; const lower = txt.toLowerCase(); return /open|closed|hours/.test(lower) || txt.length < 5; }
             const results = [];
@@ -209,8 +214,8 @@ async def _extract_cards(page):
                 const mapsEl = card.querySelector('a.hfpxzc'); if (mapsEl) row.maps_url = mapsEl.href || '';
                 card.querySelectorAll('[aria-label]').forEach(el => {
                     const label = (el.getAttribute('aria-label') || '').trim();
-                    if (/^Address[:\s]/i.test(label) && !row.address) { const addr = label.replace(/^Address[:\s]*/i,'').trim(); if (!isJunk(addr)) row.address = addr; }
-                    if (/^Phone[:\s]/i.test(label) && !row.phone) row.phone = label.replace(/^Phone[:\s]*/i,'').trim();
+                    if (/^Address[:\\s]/i.test(label) && !row.address) { const addr = label.replace(/^Address[:\\s]*/i,'').trim(); if (!isJunk(addr)) row.address = addr; }
+                    if (/^Phone[:\\s]/i.test(label) && !row.phone) row.phone = label.replace(/^Phone[:\\s]*/i,'').trim();
                 });
                 if (!row.phone) { const telEl = card.querySelector('a[href^="tel:"]'); if (telEl) row.phone = telEl.href.replace('tel:','').trim(); }
                 results.push(row);
@@ -232,7 +237,6 @@ async def _extract_cards(page):
 
 
 async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
-    """Scrape one city from Google Maps. Updates job_cities progress."""
     query = f"{industry} in {city}, {state}"
     out_file = out_dir / f"{sanitize(city)}_{state}.csv"
 
@@ -240,7 +244,7 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
 
     context = await browser.new_context(
         viewport={"width": 1280, "height": 900},
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     )
     page = await context.new_page()
     await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,ico,mp4,mp3}", lambda r: r.abort())
@@ -249,27 +253,44 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
     try:
         url = "https://www.google.com/maps/search/" + query.replace(" ", "+")
         await page.goto(url, timeout=45000, wait_until="domcontentloaded")
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
+
+        # Handle consent/cookie page
+        for btn_text in ["Accept all", "Reject all", "Accept", "I agree"]:
+            try:
+                btn = page.locator(f'button:has-text("{btn_text}")').first
+                if await btn.is_visible(timeout=2000):
+                    await btn.click()
+                    await asyncio.sleep(1)
+                    break
+            except:
+                pass
+
+        # Wait for feed
         try:
-            btn = page.locator('button:has-text("Accept all")').first
-            if await btn.is_visible(timeout=2000): await btn.click(); await asyncio.sleep(0.5)
-        except: pass
-        try:
-            await page.wait_for_selector('div[role="feed"]', timeout=10000)
-        except:
+            await page.wait_for_selector('div[role="feed"]', timeout=15000)
+        except Exception as e:
+            # Log page title for debugging
+            title = await page.title()
+            content = await page.content()
+            print(f"[RUNNER] Feed not found for {city}. Title: {title}. Content length: {len(content)}")
             await context.close()
             await _update_city(pool, job_id, city, maps_status="done", maps_leads=0)
             return []
 
         await _scroll_to_end(page)
         results = await _extract_cards(page)
+        print(f"[RUNNER] {city}: found {len(results)} results")
 
         if results:
             fields = ["Name","Category","Rating","Reviews","Address","Phone","Email","Website","Maps_URL"]
             with open(out_file, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(results)
+                w = csv.DictWriter(f, fieldnames=fields)
+                w.writeheader()
+                w.writerows(results)
 
     except Exception as e:
+        print(f"[RUNNER] Error scraping {city}: {e}")
         await _update_city(pool, job_id, city, maps_status="failed", error=str(e)[:200])
         return []
     finally:
@@ -284,7 +305,6 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
 #  STEP 2 — PREPROCESS
 # ═══════════════════════════════════════════════════════════════
 def _preprocess(folder_path: Path, state: str, industry: str):
-    """Clean + deduplicate. Returns (with_web_df, no_web_df)."""
     import glob
     all_files = glob.glob(str(folder_path / "*.csv"))
     if not all_files:
@@ -341,7 +361,8 @@ async def _extract_emails_from_page(page, is_homepage=False):
                     "footer, #footer, .footer, [class*='footer']", timeout=FOOTER_WAIT_MS, state="attached"
                 )
                 await asyncio.sleep(1.2)
-            except: await asyncio.sleep(0.8)
+            except:
+                await asyncio.sleep(0.8)
         else:
             await asyncio.sleep(0.8)
 
@@ -362,10 +383,10 @@ async def _extract_emails_from_page(page, is_homepage=False):
                 """)
                 for e in EMAIL_REGEX.findall(text):
                     if is_valid_email(e): found.add(clean_email(e))
-            except: pass
+            except:
+                pass
 
         body_text = await page.inner_text("body")
-        import html as htmllib
         clean_html = re.sub(r"<(script|style|noscript)[^>]*>[\s\S]*?</\1>", "", await page.content(), flags=re.IGNORECASE)
         for e in EMAIL_REGEX.findall(body_text + " " + clean_html):
             if is_valid_email(e): found.add(clean_email(e))
@@ -373,7 +394,8 @@ async def _extract_emails_from_page(page, is_homepage=False):
         decoded = body_text.replace("[at]","@").replace("[dot]",".").replace(" at ","@").replace(" dot ",".")
         for e in EMAIL_REGEX.findall(decoded):
             if is_valid_email(e): found.add(clean_email(e))
-    except: pass
+    except:
+        pass
     return found
 
 
@@ -402,7 +424,8 @@ async def _crawl_site_for_email(context, start_url):
             await page.set_extra_http_headers({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"})
             await page.goto(url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
             return await _extract_emails_from_page(page, is_homepage=is_hp)
-        except: return set()
+        except:
+            return set()
         finally:
             try: await page.close()
             except: pass
@@ -422,7 +445,11 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
     done  = [0]
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, slow_mo=0)
+        browser = await p.chromium.launch(
+            headless=True,
+            slow_mo=0,
+            args=CHROMIUM_ARGS,
+        )
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
@@ -460,13 +487,8 @@ async def run_scrape_job(
     cities: list[str],
     include_emails: bool,
     pool: asyncpg.Pool,
-    upload_fn,          # async (bytes, storage_path: str) -> str
+    upload_fn,
 ) -> dict:
-    """
-    Run a full scrape job. Updates the jobs table throughout.
-    Returns summary dict on success. Raises on fatal error.
-    """
-
     await _update_job(pool, job_id,
                       status="running",
                       started_at="NOW()",
@@ -478,7 +500,11 @@ async def run_scrape_job(
 
         # ── STEP 1: Google Maps ──────────────────────────────
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, slow_mo=0)
+            browser = await p.chromium.launch(
+                headless=True,
+                slow_mo=0,
+                args=CHROMIUM_ARGS,
+            )
             total_raw = 0
             for i, city in enumerate(cities):
                 await _update_job(pool, job_id,
@@ -509,7 +535,7 @@ async def run_scrape_job(
                           no_website=no_website_cnt,
                           duplicates_removed=max(duplicates, 0))
 
-        # ── STEP 3: Email scraping (if plan allows) ──────────
+        # ── STEP 3: Email scraping ───────────────────────────
         if include_emails and not with_web_df.empty:
             await _update_job(pool, job_id,
                               current_step="step3_emails",
@@ -518,7 +544,7 @@ async def run_scrape_job(
             await _update_job(pool, job_id,
                               emails_done_at="NOW()")
 
-        # ── UPLOAD CSVs to Supabase Storage ─────────────────
+        # ── UPLOAD CSVs ──────────────────────────────────────
         with_web_path = f"{user_id}/{job_id}/with_website.csv"
         no_web_path   = f"{user_id}/{job_id}/no_website.csv"
 
@@ -532,7 +558,6 @@ async def run_scrape_job(
 
         emails_found = int(with_web_df["Email"].astype(str).str.strip().ne("").sum()) if not with_web_df.empty else 0
 
-        # ── Mark complete ────────────────────────────────────
         await _update_job(pool, job_id,
                           status="done",
                           current_step="complete",
