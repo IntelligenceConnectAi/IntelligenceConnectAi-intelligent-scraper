@@ -20,7 +20,7 @@ from playwright.async_api import async_playwright
 # ═══════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════
-MAX_CONCURRENT_SITES = 10
+MAX_CONCURRENT_SITES = 3
 PAGE_TIMEOUT_MS      = 12000
 FOOTER_WAIT_MS       = 3000
 
