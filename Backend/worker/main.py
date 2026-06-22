@@ -26,7 +26,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Global concurrency limit ──────────────────────────────────
-MAX_GLOBAL_CONCURRENT = 5   # max jobs running at once across all users
+MAX_GLOBAL_CONCURRENT = 2   # max jobs running at once across all users
 
 # job_id → user_id for currently running jobs
 _running: dict[str, str] = {}
