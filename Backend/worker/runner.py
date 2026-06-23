@@ -20,7 +20,7 @@ from playwright.async_api import async_playwright
 # ═══════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════
-MAX_CONCURRENT_SITES = 15
+MAX_CONCURRENT_SITES = 5
 PAGE_TIMEOUT_MS      = 12000
 FOOTER_WAIT_MS       = 3000
 EMAIL_CRAWL_TIMEOUT  = 30.0   # max seconds per site — prevents hang
