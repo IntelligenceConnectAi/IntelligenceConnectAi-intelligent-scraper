@@ -600,12 +600,11 @@ async def run_scrape_job(
     with tempfile.TemporaryDirectory() as tmpdir:
         out_dir = Path(tmpdir)
 
-        # ── STEP 1: Google Maps (minimal flags — same as local) ──
+        # ── STEP 1: Google Maps (no flags — same as local scrap.py) ──
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
                 slow_mo=0,
-                args=MAPS_CHROMIUM_ARGS,
             )
             total_raw = 0
             for i, city in enumerate(cities):
