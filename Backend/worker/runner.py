@@ -201,6 +201,7 @@ async def _extract_cards(page):
             cards.forEach(card => {
                 const row = { name:'', category:'', rating:'', reviews:'', address:'', phone:'', website:'', maps_url:'' };
 
+                // Name: aria-label on main link (most stable)
                 const mainLink = card.querySelector('a.hfpxzc');
                 if (mainLink) {
                     row.maps_url = mainLink.href || '';
@@ -208,50 +209,79 @@ async def _extract_cards(page):
                     if (label) row.name = label.trim();
                 }
                 if (!row.name) {
-                    const nameSelectors = ['.qBF1Pd', '[class*="fontHeadlineSmall"]', 'h3', 'h2'];
+                    const nameSelectors = ['.qBF1Pd', '[class*=\"fontHeadlineSmall\"]', 'h3', 'h2'];
                     for (const sel of nameSelectors) {
                         const el = card.querySelector(sel);
                         if (el && el.innerText && el.innerText.trim().length > 1) {
-                            row.name = el.innerText.trim();
-                            break;
+                            row.name = el.innerText.trim(); break;
                         }
                     }
                 }
                 if (!row.name) return;
 
-                const webEl = card.querySelector('a[data-value="Website"], a[data-item-id="authority"]');
+                // Website
+                const webEl = card.querySelector('a[data-value=\"Website\"], a[data-item-id=\"authority\"]');
                 if (webEl) row.website = webEl.href || '';
 
-                const ratingEl = card.querySelector('.MW4etd');
-                if (ratingEl) row.rating = ratingEl.innerText.trim();
+                // Rating: aria-label is most stable
+                card.querySelectorAll('[aria-label]').forEach(el => {
+                    const lb = el.getAttribute('aria-label') || '';
+                    const m = lb.match(/([\d.]+)\s+star/i);
+                    if (m && !row.rating) row.rating = m[1];
+                });
                 if (!row.rating) {
-                    card.querySelectorAll('[aria-label]').forEach(el => {
-                        const lb = el.getAttribute('aria-label') || '';
-                        const m = lb.match(/([\\d.]+)\\s+star/i);
-                        if (m && !row.rating) row.rating = m[1];
-                    });
+                    const rEl = card.querySelector('.MW4etd');
+                    if (rEl) row.rating = rEl.innerText.trim();
                 }
 
-                const revEl = card.querySelector('.UY7F9');
-                if (revEl) row.reviews = revEl.innerText.replace(/[()]/g,'').trim();
+                // Reviews: aria-label
+                card.querySelectorAll('[aria-label]').forEach(el => {
+                    const lb = el.getAttribute('aria-label') || '';
+                    const m = lb.match(/([\d,]+)\s+review/i);
+                    if (m && !row.reviews) row.reviews = m[1].replace(/,/g,'');
+                });
+                if (!row.reviews) {
+                    const rvEl = card.querySelector('.UY7F9');
+                    if (rvEl) row.reviews = rvEl.innerText.replace(/[()]/g,'').trim();
+                }
 
+                // Address & Phone from aria-labels
                 card.querySelectorAll('[aria-label]').forEach(el => {
                     const label = (el.getAttribute('aria-label') || '').trim();
-                    if (/^Address[:\\s]/i.test(label) && !row.address) {
-                        row.address = label.replace(/^Address[:\\s]*/i,'').trim();
+                    if (/^Address[:\s]/i.test(label) && !row.address) {
+                        row.address = label.replace(/^Address[:\s]*/i,'').trim();
                     }
-                    if (/^Phone[:\\s]/i.test(label) && !row.phone) {
-                        row.phone = label.replace(/^Phone[:\\s]*/i,'').trim();
+                    if (/^Phone[:\s]/i.test(label) && !row.phone) {
+                        row.phone = label.replace(/^Phone[:\s]*/i,'').trim();
                     }
                 });
 
+                // Phone fallback: tel: link
                 if (!row.phone) {
-                    const telEl = card.querySelector('a[href^="tel:"]');
+                    const telEl = card.querySelector('a[href^=\"tel:\"]');
                     if (telEl) row.phone = telEl.href.replace('tel:','').trim();
                 }
 
-                const catEl = card.querySelector('.W4Efsd .W4Efsd span, [class*="fontBodyMedium"] span');
-                if (catEl) row.category = catEl.innerText.trim();
+                // Address fallback: data-item-id
+                if (!row.address) {
+                    const addrEl = card.querySelector('[data-item-id=\"address\"]');
+                    if (addrEl) {
+                        const txt = (addrEl.getAttribute('aria-label') || addrEl.innerText || '').replace(/^Address[:\s]*/i,'').trim();
+                        if (txt) row.address = txt;
+                    }
+                }
+
+                // Category
+                const catSelectors = ['.W4Efsd .W4Efsd span', '[class*=\"fontBodyMedium\"] span', '.W4Efsd span'];
+                for (const sel of catSelectors) {
+                    const el = card.querySelector(sel);
+                    if (el) {
+                        const txt = el.innerText.trim();
+                        if (txt && txt.length > 1 && !txt.match(/^[\d.]+$/) && txt !== row.name) {
+                            row.category = txt; break;
+                        }
+                    }
+                }
 
                 results.push(row);
             });
