@@ -1,6 +1,8 @@
 """
 Intelligent Scraper — Job Runner
 Based on best working local scrap.py logic.
+Maps scraping uses minimal flags (same as local).
+Email scraping uses full Docker flags.
 """
 
 import asyncio
@@ -23,7 +25,7 @@ from playwright.async_api import async_playwright
 MAX_CONCURRENT_SITES = 5
 PAGE_TIMEOUT_MS      = 12000
 FOOTER_WAIT_MS       = 3000
-EMAIL_CRAWL_TIMEOUT  = 30.0   # max seconds per site — prevents hang
+EMAIL_CRAWL_TIMEOUT  = 30.0
 
 PRIORITY_PATHS = [
     "",
@@ -44,7 +46,15 @@ LEGIT_TLDS = {
 }
 EMAIL_REGEX = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Z|a-z]{2,}\b")
 
-CHROMIUM_ARGS = [
+# Minimal flags for Maps scraping (same as local — avoids DOM rendering differences)
+MAPS_CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+]
+
+# Full flags for email scraping (Docker safe)
+EMAIL_CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
@@ -198,11 +208,7 @@ async def _scroll_to_end(page):
 
 
 async def _extract_cards(page):
-    """
-    Extract cards using best working JS logic from local scrap.py.
-    Uses .qBF1Pd for name, aria-label fallback, and W4Efsd span scanning
-    for address/phone — same approach that works on 16GB local machine.
-    """
+    """Exact same JS logic as working local scrap.py extract_all_at_once."""
     data = await page.evaluate("""
         () => {
             const phoneRegex = /(\\(?\\d{3}\\)?[\\s\\-\\.]?\\d{3}[\\s\\-\\.]?\\d{4})/;
@@ -221,45 +227,36 @@ async def _extract_cards(page):
                 const lower = txt.toLowerCase();
                 return /open|closed|hours|^\\d+(\\.\\d)?\\s*\\(/.test(lower) || txt.length < 5;
             }
-
             const results = [];
             document.querySelectorAll('div[role="feed"] > div > div[jsaction]').forEach(card => {
                 const row = { name:'', category:'', rating:'', reviews:'', address:'', phone:'', website:'', maps_url:'' };
 
-                // ── Name: try .qBF1Pd first, then aria-label on main link ──
                 const nameEl = card.querySelector('.qBF1Pd');
                 if (nameEl) row.name = nameEl.innerText.trim();
                 if (!row.name) {
                     const mainLink = card.querySelector('a.hfpxzc');
                     if (mainLink) {
-                        row.maps_url = mainLink.href || '';
                         const label = mainLink.getAttribute('aria-label') || '';
                         if (label) row.name = label.trim();
                     }
                 }
                 if (!row.name) return;
 
-                // ── Maps URL ──
-                const mapsEl = card.querySelector('a.hfpxzc');
-                if (mapsEl) row.maps_url = mapsEl.href || '';
-
-                // ── Category ──
                 const catEl = card.querySelector('.W4Efsd .W4Efsd span');
                 if (catEl) row.category = catEl.innerText.trim();
 
-                // ── Rating ──
                 const ratingEl = card.querySelector('.MW4etd');
                 if (ratingEl) row.rating = ratingEl.innerText.trim();
 
-                // ── Reviews ──
                 const revEl = card.querySelector('.UY7F9');
                 if (revEl) row.reviews = revEl.innerText.replace(/[()]/g,'').trim();
 
-                // ── Website ──
                 const webEl = card.querySelector('a[data-value="Website"]');
                 if (webEl) row.website = webEl.href || '';
 
-                // ── Address & Phone: aria-label first ──
+                const mapsEl = card.querySelector('a.hfpxzc');
+                if (mapsEl) row.maps_url = mapsEl.href || '';
+
                 card.querySelectorAll('[aria-label]').forEach(el => {
                     const label = (el.getAttribute('aria-label') || '').trim();
                     if (/^Address[:\\s]/i.test(label) && !row.address) {
@@ -271,7 +268,6 @@ async def _extract_cards(page):
                     }
                 });
 
-                // ── Address fallback: data-item-id ──
                 if (!row.address) {
                     const addrEl = card.querySelector('[data-item-id="address"]');
                     if (addrEl) {
@@ -281,34 +277,25 @@ async def _extract_cards(page):
                     }
                 }
 
-                // ── Phone fallback: tel: link ──
                 if (!row.phone) {
                     const telEl = card.querySelector('a[href^="tel:"]');
                     if (telEl) row.phone = telEl.href.replace('tel:','').trim();
                 }
 
-                // ── Address fallback: scan .W4Efsd spans ──
                 if (!row.address) {
                     const spans = card.querySelectorAll('.W4Efsd > span, .W4Efsd > div');
                     for (const span of spans) {
                         const txt = span.innerText.split('\\n')[0].trim();
-                        if (looksLikeAddress(txt) && !isJunk(txt)) {
-                            row.address = txt;
-                            break;
-                        }
+                        if (looksLikeAddress(txt) && !isJunk(txt)) { row.address = txt; break; }
                     }
                 }
 
-                // ── Phone fallback: scan .W4Efsd spans ──
                 if (!row.phone) {
                     const spans = card.querySelectorAll('.W4Efsd span, .W4Efsd div');
                     for (const span of spans) {
                         const txt = span.innerText.split('\\n')[0].trim();
                         const ph = looksLikePhone(txt);
-                        if (ph && txt.replace(/[\\d\\s\\-\\(\\)\\+]/g,'').length < 3) {
-                            row.phone = ph;
-                            break;
-                        }
+                        if (ph && txt.replace(/[\\d\\s\\-\\(\\)\\+]/g,'').length < 3) { row.phone = ph; break; }
                     }
                 }
 
@@ -349,7 +336,6 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
         await page.goto(url, timeout=45000, wait_until="domcontentloaded")
         await asyncio.sleep(2)
 
-        # Handle consent
         try:
             btn = page.locator('button:has-text("Accept all")').first
             if await btn.is_visible(timeout=2000):
@@ -457,7 +443,6 @@ async def _extract_emails_from_page(page, is_homepage=False):
         else:
             await asyncio.sleep(0.8)
 
-        # 1. mailto: links
         mailtos = await page.evaluate(
             "() => Array.from(document.querySelectorAll('a[href^=\"mailto:\"]')).map(a => a.getAttribute('href'))"
         )
@@ -465,7 +450,6 @@ async def _extract_emails_from_page(page, is_homepage=False):
             email = m.replace("mailto:", "").split("?")[0].strip()
             if is_valid_email(email): found.add(clean_email(email))
 
-        # 2. header
         try:
             header_text = await page.evaluate("""
                 () => {
@@ -477,7 +461,6 @@ async def _extract_emails_from_page(page, is_homepage=False):
                 if is_valid_email(e): found.add(clean_email(e))
         except: pass
 
-        # 3. footer
         try:
             footer_text = await page.evaluate("""
                 () => {
@@ -489,13 +472,11 @@ async def _extract_emails_from_page(page, is_homepage=False):
                 if is_valid_email(e): found.add(clean_email(e))
         except: pass
 
-        # 4. full body
         body_text = await page.inner_text("body")
         clean_html = re.sub(r"<(script|style|noscript)[^>]*>[\s\S]*?</\1>", "", await page.content(), flags=re.IGNORECASE)
         for e in EMAIL_REGEX.findall(body_text + " " + clean_html):
             if is_valid_email(e): found.add(clean_email(e))
 
-        # 5. obfuscated
         decoded = body_text.replace("[at]","@").replace("[dot]",".").replace(" at ","@").replace(" dot ",".")
         for e in EMAIL_REGEX.findall(decoded):
             if is_valid_email(e): found.add(clean_email(e))
@@ -555,7 +536,9 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=True, slow_mo=0, args=CHROMIUM_ARGS,
+            headless=True,
+            slow_mo=0,
+            args=EMAIL_CHROMIUM_ARGS,
         )
 
         async def process_one(row):
@@ -617,10 +600,12 @@ async def run_scrape_job(
     with tempfile.TemporaryDirectory() as tmpdir:
         out_dir = Path(tmpdir)
 
-        # ── STEP 1: Google Maps ──
+        # ── STEP 1: Google Maps (minimal flags — same as local) ──
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=True, slow_mo=0, args=CHROMIUM_ARGS,
+                headless=True,
+                slow_mo=0,
+                args=MAPS_CHROMIUM_ARGS,
             )
             total_raw = 0
             for i, city in enumerate(cities):
