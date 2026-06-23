@@ -23,6 +23,7 @@ from playwright.async_api import async_playwright
 MAX_CONCURRENT_SITES = 15
 PAGE_TIMEOUT_MS      = 12000
 FOOTER_WAIT_MS       = 3000
+EMAIL_CRAWL_TIMEOUT  = 30.0   # max seconds per site — prevents hang
 
 PRIORITY_PATHS = [
     "",
@@ -43,7 +44,6 @@ LEGIT_TLDS = {
 }
 EMAIL_REGEX = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Z|a-z]{2,}\b")
 
-# Chromium args for Docker/Railway environment
 CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -201,14 +201,12 @@ async def _extract_cards(page):
             cards.forEach(card => {
                 const row = { name:'', category:'', rating:'', reviews:'', address:'', phone:'', website:'', maps_url:'' };
 
-                // Name: try aria-label on main link first (most stable)
                 const mainLink = card.querySelector('a.hfpxzc');
                 if (mainLink) {
                     row.maps_url = mainLink.href || '';
                     const label = mainLink.getAttribute('aria-label') || '';
                     if (label) row.name = label.trim();
                 }
-                // Fallback name selectors
                 if (!row.name) {
                     const nameSelectors = ['.qBF1Pd', '[class*="fontHeadlineSmall"]', 'h3', 'h2'];
                     for (const sel of nameSelectors) {
@@ -221,11 +219,9 @@ async def _extract_cards(page):
                 }
                 if (!row.name) return;
 
-                // Website
                 const webEl = card.querySelector('a[data-value="Website"], a[data-item-id="authority"]');
                 if (webEl) row.website = webEl.href || '';
 
-                // Rating
                 const ratingEl = card.querySelector('.MW4etd');
                 if (ratingEl) row.rating = ratingEl.innerText.trim();
                 if (!row.rating) {
@@ -236,11 +232,9 @@ async def _extract_cards(page):
                     });
                 }
 
-                // Reviews
                 const revEl = card.querySelector('.UY7F9');
                 if (revEl) row.reviews = revEl.innerText.replace(/[()]/g,'').trim();
 
-                // Address & Phone from aria-labels
                 card.querySelectorAll('[aria-label]').forEach(el => {
                     const label = (el.getAttribute('aria-label') || '').trim();
                     if (/^Address[:\\s]/i.test(label) && !row.address) {
@@ -251,13 +245,11 @@ async def _extract_cards(page):
                     }
                 });
 
-                // Phone fallback
                 if (!row.phone) {
                     const telEl = card.querySelector('a[href^="tel:"]');
                     if (telEl) row.phone = telEl.href.replace('tel:','').trim();
                 }
 
-                // Category from text
                 const catEl = card.querySelector('.W4Efsd .W4Efsd span, [class*="fontBodyMedium"] span');
                 if (catEl) row.category = catEl.innerText.trim();
 
@@ -298,7 +290,6 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
         await page.goto(url, timeout=45000, wait_until="domcontentloaded")
         await asyncio.sleep(3)
 
-        # Handle consent/cookie page
         for btn_text in ["Accept all", "Reject all", "Accept", "I agree"]:
             try:
                 btn = page.locator(f'button:has-text("{btn_text}")').first
@@ -309,11 +300,9 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
             except:
                 pass
 
-        # Wait for feed
         try:
             await page.wait_for_selector('div[role="feed"]', timeout=15000)
         except Exception as e:
-            # Log page title for debugging
             title = await page.title()
             content = await page.content()
             print(f"[RUNNER] Feed not found for {city}. Title: {title}. Content length: {len(content)}")
@@ -321,7 +310,6 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
             await _update_city(pool, job_id, city, maps_status="done", maps_leads=0)
             return []
 
-        # Debug logging
         title = await page.title()
         card_count = await page.locator('div[role="feed"] > div > div[jsaction]').count()
         print(f"[RUNNER] {city}: title={title}, cards_before_scroll={card_count}")
@@ -451,8 +439,8 @@ async def _crawl_site_for_email(context, start_url):
     if not start_url or not start_url.startswith(("http://", "https://")):
         return ""
 
-    base_url = start_url.rstrip("/")
-    visited  = set()
+    base_url   = start_url.rstrip("/")
+    visited    = set()
     all_emails = set()
     FREE = {"gmail.com","yahoo.com","hotmail.com","outlook.com","aol.com","mail.com"}
 
@@ -489,8 +477,8 @@ async def _crawl_site_for_email(context, start_url):
 
 async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.DataFrame:
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_SITES)
-    total = len(df)
-    done  = [0]
+    total  = len(df)
+    done   = [0]
     records = df.to_dict("records")
 
     async with async_playwright() as p:
@@ -508,13 +496,21 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
                 )
                 try:
-                    row["Email"] = await _crawl_site_for_email(ctx, row["Website"])
+                    # ── KEY FIX: 30 second timeout per site ──
+                    row["Email"] = await asyncio.wait_for(
+                        _crawl_site_for_email(ctx, row["Website"]),
+                        timeout=EMAIL_CRAWL_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"[RUNNER] Timeout: {row.get('Website')}")
+                    row["Email"] = ""
                 except Exception as e:
                     print(f"[RUNNER] Email crawl error: {e}")
                     row["Email"] = ""
                 finally:
                     try: await ctx.close()
                     except: pass
+
                 done[0] += 1
                 if done[0] % 10 == 0 or done[0] == total:
                     found = sum(1 for r in records if r.get("Email"))
@@ -528,6 +524,9 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
     return pd.DataFrame(records)
 
 
+# ═══════════════════════════════════════════════════════════════
+#  MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════════
 async def run_scrape_job(
     *,
     job_id: str,
@@ -574,10 +573,10 @@ async def run_scrape_job(
         # ── STEP 2: Preprocess ───────────────────────────────
         with_web_df, no_web_df = _preprocess(out_dir, state, industry)
 
-        total_clean       = len(with_web_df) + len(no_web_df)
-        with_website_cnt  = len(with_web_df)
-        no_website_cnt    = len(no_web_df)
-        duplicates        = total_raw - total_clean
+        total_clean      = len(with_web_df) + len(no_web_df)
+        with_website_cnt = len(with_web_df)
+        no_website_cnt   = len(no_web_df)
+        duplicates       = total_raw - total_clean
 
         await _update_job(pool, job_id,
                           total_clean=total_clean,
