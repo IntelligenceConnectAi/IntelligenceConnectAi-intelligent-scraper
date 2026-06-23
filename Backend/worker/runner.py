@@ -256,19 +256,44 @@ async def _extract_cards(page):
                     }
                 });
 
-                // Phone fallback: tel: link
+                // Phone fallback 1: tel: link
                 if (!row.phone) {
                     const telEl = card.querySelector('a[href^=\"tel:\"]');
                     if (telEl) row.phone = telEl.href.replace('tel:','').trim();
                 }
 
-                // Address fallback: data-item-id
+                // Phone fallback 2: scan spans for phone pattern
+                if (!row.phone) {
+                    const phoneRegex = /(\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4})/;
+                    card.querySelectorAll('span, div').forEach(el => {
+                        if (row.phone) return;
+                        const txt = (el.innerText || '').trim();
+                        const m = txt.match(phoneRegex);
+                        if (m && txt.replace(/[\d\s\-\.\(\)\+]/g,'').length < 3) {
+                            row.phone = m[0];
+                        }
+                    });
+                }
+
+                // Address fallback 1: data-item-id
                 if (!row.address) {
                     const addrEl = card.querySelector('[data-item-id=\"address\"]');
                     if (addrEl) {
                         const txt = (addrEl.getAttribute('aria-label') || addrEl.innerText || '').replace(/^Address[:\s]*/i,'').trim();
                         if (txt) row.address = txt;
                     }
+                }
+
+                // Address fallback 2: scan spans for address pattern
+                if (!row.address) {
+                    const addrKeywords = [' St',' Ave',' Rd',' Blvd',' Dr',' Ln',' Way',' Ct',' Pl',' Hwy',' Pkwy',' Suite',' Ste'];
+                    card.querySelectorAll('span, div').forEach(el => {
+                        if (row.address) return;
+                        const txt = (el.innerText || '').split('\n')[0].trim();
+                        if (txt.length > 8 && /\d/.test(txt) && addrKeywords.some(kw => txt.includes(kw))) {
+                            row.address = txt;
+                        }
+                    });
                 }
 
                 // Category
