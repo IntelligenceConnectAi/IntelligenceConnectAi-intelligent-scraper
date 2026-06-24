@@ -208,14 +208,15 @@ async def _scroll_to_end(page):
 
 
 async def _extract_cards(page):
-    """Exact same JS logic as working local scrap.py extract_all_at_once."""
+    """CSS-class independent extraction using text patterns + aria-label + tel: links."""
     data = await page.evaluate("""
         () => {
-            const phoneRegex = /(\\(?\\d{3}\\)?[\\s\\-\\.]?\\d{3}[\\s\\-\\.]?\\d{4})/;
+            const phoneRegex = /(\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4})/;
             const addressKeywords = [' St',' St,',' Ave',' Ave,',' Rd',' Rd,',' Blvd',' Dr',' Dr,',' Ln',' Ln,',' Way',' Ct',' Ct,',' Pl',' Pl,',' Hwy',' Pkwy',' Suite',' #',' Ste'];
+
             function looksLikeAddress(txt) {
                 if (!txt || txt.length < 5) return false;
-                return /\\d/.test(txt) && addressKeywords.some(kw => txt.includes(kw));
+                return /\d/.test(txt) && addressKeywords.some(kw => txt.includes(kw));
             }
             function looksLikePhone(txt) {
                 if (!txt) return false;
@@ -225,12 +226,14 @@ async def _extract_cards(page):
             function isJunk(txt) {
                 if (!txt) return true;
                 const lower = txt.toLowerCase();
-                return /open|closed|hours|^\\d+(\\.\\d)?\\s*\\(/.test(lower) || txt.length < 5;
+                return /open|closed|hours|^\d+(\.\d)?\s*\(/.test(lower) || txt.length < 5;
             }
+
             const results = [];
             document.querySelectorAll('div[role="feed"] > div > div[jsaction]').forEach(card => {
                 const row = { name:'', category:'', rating:'', reviews:'', address:'', phone:'', website:'', maps_url:'' };
 
+                // ── Name: .qBF1Pd first, then aria-label on main link ──
                 const nameEl = card.querySelector('.qBF1Pd');
                 if (nameEl) row.name = nameEl.innerText.trim();
                 if (!row.name) {
@@ -242,61 +245,88 @@ async def _extract_cards(page):
                 }
                 if (!row.name) return;
 
-                const catEl = card.querySelector('.W4Efsd .W4Efsd span');
-                if (catEl) row.category = catEl.innerText.trim();
-
-                const ratingEl = card.querySelector('.MW4etd');
-                if (ratingEl) row.rating = ratingEl.innerText.trim();
-
-                const revEl = card.querySelector('.UY7F9');
-                if (revEl) row.reviews = revEl.innerText.replace(/[()]/g,'').trim();
-
-                const webEl = card.querySelector('a[data-value="Website"]');
-                if (webEl) row.website = webEl.href || '';
-
+                // ── Maps URL ──
                 const mapsEl = card.querySelector('a.hfpxzc');
                 if (mapsEl) row.maps_url = mapsEl.href || '';
 
+                // ── Website ──
+                const webEl = card.querySelector('a[data-value="Website"]');
+                if (webEl) row.website = webEl.href || '';
+
+                // ── Get full card text for pattern-based extraction ──
+                const allText = card.innerText || '';
+
+                // ── Rating: CSS class first, then regex on full text ──
+                const ratingEl = card.querySelector('.MW4etd');
+                if (ratingEl) row.rating = ratingEl.innerText.trim();
+                if (!row.rating) {
+                    const rMatch = allText.match(/\b([1-4]\.[0-9]|5\.0)\b/);
+                    if (rMatch) row.rating = rMatch[1];
+                }
+
+                // ── Reviews: CSS class first, then parentheses pattern ──
+                const revEl = card.querySelector('.UY7F9');
+                if (revEl) row.reviews = revEl.innerText.replace(/[()]/g,'').trim();
+                if (!row.reviews) {
+                    const rvMatch = allText.match(/\(([0-9,]+)\)/);
+                    if (rvMatch) row.reviews = rvMatch[1].replace(/,/g,'');
+                }
+
+                // ── Category: CSS class ──
+                const catEl = card.querySelector('.W4Efsd .W4Efsd span');
+                if (catEl) row.category = catEl.innerText.trim();
+
+                // ── Address & Phone: aria-label first ──
                 card.querySelectorAll('[aria-label]').forEach(el => {
                     const label = (el.getAttribute('aria-label') || '').trim();
-                    if (/^Address[:\\s]/i.test(label) && !row.address) {
-                        const addr = label.replace(/^Address[:\\s]*/i,'').trim();
+                    if (/^Address[:\s]/i.test(label) && !row.address) {
+                        const addr = label.replace(/^Address[:\s]*/i,'').trim();
                         if (!isJunk(addr)) row.address = addr;
                     }
-                    if (/^Phone[:\\s]/i.test(label) && !row.phone) {
-                        row.phone = label.replace(/^Phone[:\\s]*/i,'').trim();
+                    if (/^Phone[:\s]/i.test(label) && !row.phone) {
+                        row.phone = label.replace(/^Phone[:\s]*/i,'').trim();
                     }
                 });
 
+                // ── Address fallback: data-item-id ──
                 if (!row.address) {
                     const addrEl = card.querySelector('[data-item-id="address"]');
                     if (addrEl) {
                         const txt = addrEl.getAttribute('aria-label') || addrEl.innerText || '';
-                        const clean = txt.replace(/^Address[:\\s]*/i,'').trim();
+                        const clean = txt.replace(/^Address[:\s]*/i,'').trim();
                         if (looksLikeAddress(clean)) row.address = clean;
                     }
                 }
 
+                // ── Phone fallback: tel: link ──
                 if (!row.phone) {
                     const telEl = card.querySelector('a[href^="tel:"]');
                     if (telEl) row.phone = telEl.href.replace('tel:','').trim();
                 }
 
+                // ── Address fallback: scan all spans ──
                 if (!row.address) {
-                    const spans = card.querySelectorAll('.W4Efsd > span, .W4Efsd > div');
+                    const spans = card.querySelectorAll('.W4Efsd > span, .W4Efsd > div, span, div');
                     for (const span of spans) {
-                        const txt = span.innerText.split('\\n')[0].trim();
+                        const txt = (span.innerText || '').split('\n')[0].trim();
                         if (looksLikeAddress(txt) && !isJunk(txt)) { row.address = txt; break; }
                     }
                 }
 
+                // ── Phone fallback: scan all spans ──
                 if (!row.phone) {
-                    const spans = card.querySelectorAll('.W4Efsd span, .W4Efsd div');
+                    const spans = card.querySelectorAll('.W4Efsd span, .W4Efsd div, span, div');
                     for (const span of spans) {
-                        const txt = span.innerText.split('\\n')[0].trim();
+                        const txt = (span.innerText || '').split('\n')[0].trim();
                         const ph = looksLikePhone(txt);
-                        if (ph && txt.replace(/[\\d\\s\\-\\(\\)\\+]/g,'').length < 3) { row.phone = ph; break; }
+                        if (ph && txt.replace(/[\d\s\-\(\)\+]/g,'').length < 3) { row.phone = ph; break; }
                     }
+                }
+
+                // ── Phone final fallback: regex on full card text ──
+                if (!row.phone) {
+                    const phMatch = allText.match(phoneRegex);
+                    if (phMatch) row.phone = phMatch[0];
                 }
 
                 results.push(row);
@@ -538,7 +568,6 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
         browser = await p.chromium.launch(
             headless=True,
             slow_mo=0,
-            args=EMAIL_CHROMIUM_ARGS,
         )
 
         async def process_one(row):
