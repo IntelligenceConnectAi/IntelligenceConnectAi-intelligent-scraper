@@ -544,10 +544,17 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
         async def process_one(row):
             if not str(row.get("Website", "")).strip(): return
             async with semaphore:
-                ctx = await browser.new_context(
-                    viewport={"width": 1280, "height": 900},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-                )
+                # Wrap new_context in try/except — browser crash won't kill whole job
+                try:
+                    ctx = await browser.new_context(
+                        viewport={"width": 1280, "height": 900},
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+                    )
+                except Exception as e:
+                    print(f"[RUNNER] Context error: {e}")
+                    row["Email"] = ""
+                    done[0] += 1
+                    return
                 try:
                     row["Email"] = await asyncio.wait_for(
                         _crawl_site_for_email(ctx, row["Website"]),
