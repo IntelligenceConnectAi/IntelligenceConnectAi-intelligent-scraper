@@ -7,9 +7,10 @@ import Signup from "./components/Signup";
 
 // ── Plan price IDs from env ─────────────────────────────────────
 const PRICE_IDS = {
-  starter: import.meta.env.VITE_STRIPE_STARTER_PRICE_ID || "",
-  pro:     import.meta.env.VITE_STRIPE_PRO_PRICE_ID     || "",
-  elite:   import.meta.env.VITE_STRIPE_ELITE_PRICE_ID   || "",
+  starter:    import.meta.env.VITE_STRIPE_STARTER_PRICE_ID    || "",
+  pro:        import.meta.env.VITE_STRIPE_PRO_PRICE_ID        || "",
+  elite:      import.meta.env.VITE_STRIPE_ELITE_PRICE_ID      || "",
+  enterprise: import.meta.env.VITE_STRIPE_ENTERPRISE_PRICE_ID || "",
 };
 
 // ── Tab config ──────────────────────────────────────────────────
@@ -34,16 +35,13 @@ function StatCard({ label, value, accent = false, delay = 0 }) {
   );
 }
 
-// ── Pricing card (inside billing tab) ──────────────────────────
-function PricingCard({ name, price, priceId, features, popular, current, onBuy, loading }) {
+// ── Pricing card ───────────────────────────────────────────────
+function PricingCard({ name, price, priceId, features, popular, current, onBuy, loading, isEnterprise }) {
   return (
     <div className={`card relative ${popular ? "ring-2 ring-[var(--accent)]" : ""}`}
       style={{ padding: popular ? "2rem 1.25rem 1.25rem" : "1.25rem" }}>
       {popular && (
-        <div style={{
-          textAlign: "center", marginBottom: "0.75rem",
-          marginTop: "-0.5rem"
-        }}>
+        <div style={{ textAlign: "center", marginBottom: "0.75rem", marginTop: "-0.5rem" }}>
           <span className="badge badge-accent text-xs px-3">Most Popular</span>
         </div>
       )}
@@ -52,7 +50,7 @@ function PricingCard({ name, price, priceId, features, popular, current, onBuy, 
         {current && <span className="badge badge-accent text-xs">Current</span>}
       </div>
       <p className="text-2xl font-bold mono mb-3" style={{ color: popular ? "var(--accent)" : "var(--text)" }}>
-        ${price}<span className="text-sm font-normal" style={{ color: "var(--text-2)" }}>/mo</span>
+        ${price}{isEnterprise ? "+" : ""}<span className="text-sm font-normal" style={{ color: "var(--text-2)" }}>/mo</span>
       </p>
       <ul className="space-y-1.5 mb-4">
         {features.map((f, i) => (
@@ -65,6 +63,14 @@ function PricingCard({ name, price, priceId, features, popular, current, onBuy, 
         <button disabled className="btn-ghost w-full text-sm opacity-50 cursor-not-allowed">
           Active plan
         </button>
+      ) : isEnterprise ? (
+        <a
+          href="mailto:support@intelligenceconnectai.com?subject=Enterprise Plan Inquiry"
+          className="btn-primary w-full text-sm text-center block"
+          style={{ textDecoration: "none" }}
+        >
+          Contact Sales →
+        </a>
       ) : (
         <button
           onClick={() => onBuy(priceId)}
@@ -84,9 +90,7 @@ export default function App() {
   // ── Auth ──
   const [session, setSession]         = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [darkMode, setDarkMode]       = useState(() =>
-    localStorage.getItem("theme") !== "light"
-  );
+  const [darkMode, setDarkMode]       = useState(() => localStorage.getItem("theme") !== "light");
 
   // ── Login form ──
   const [view, setView]               = useState("login");
@@ -223,15 +227,12 @@ export default function App() {
   };
 
   const handleBuyPlan = async (priceId) => {
-    if (!priceId) { setBillingError("Price ID not configured. Add VITE_STRIPE_*_PRICE_ID to .env"); return; }
+    if (!priceId) { setBillingError("Price ID not configured."); return; }
     setCheckoutLoading(true); setBillingError("");
     try {
       const res = await api.createCheckout(priceId);
-      if (res.checkout_url) {
-        window.location.href = res.checkout_url;
-      } else {
-        setBillingError("No checkout URL received");
-      }
+      if (res.checkout_url) window.location.href = res.checkout_url;
+      else setBillingError("No checkout URL received");
     } catch (e) {
       setBillingError(e.message);
     } finally {
@@ -258,43 +259,69 @@ export default function App() {
     return "there";
   }, [profile]);
 
-  const dailyLimit  = usage?.daily_limit        ?? 0;
-  const leadsToday  = usage?.leads_used_today    ?? 0;
+  const dailyLimit  = usage?.daily_limit         ?? 0;
+  const leadsToday  = usage?.leads_used_today     ?? 0;
   const withWeb     = usage?.leads_with_web_today ?? 0;
   const noWeb       = usage?.leads_no_web_today   ?? 0;
   const emailsToday = usage?.emails_found_today   ?? 0;
   const remaining   = usage?.leads_remaining      ?? 0;
   const usagePct    = dailyLimit > 0 ? Math.min(100, Math.round((leadsToday / dailyLimit) * 100)) : 0;
-  const planName    = plan?.plan_name || null;
+  const planName    = plan?.plan_name  || null;
   const currentPlanId = plan?.plan_id || null;
 
+  // ── Updated plans with new pricing ──
   const PLANS = [
     {
-      id: "starter", name: "Starter", price: 29, priceId: PRICE_IDS.starter,
-      features: ["167 leads/day (~5,000/mo)", "10 cities per job", "Phone, address, website", "7-day history"],
+      id: "starter", name: "Starter", price: 49, priceId: PRICE_IDS.starter,
+      features: [
+        "5,000 leads/month",
+        "167 leads per day",
+        "10 cities per job",
+        "Phone, address, website",
+        "7-day history",
+      ],
       popular: false,
     },
     {
-      id: "pro", name: "Pro", price: 79, priceId: PRICE_IDS.pro,
-      features: ["1,333 leads/day (~40,000/mo)", "30 cities per job", "Email scraping included", "30-day history"],
+      id: "pro", name: "Pro", price: 197, priceId: PRICE_IDS.pro,
+      features: [
+        "40,000 leads/month",
+        "1,333 leads per day",
+        "30 cities per job",
+        "Email scraping included",
+        "30-day history",
+      ],
       popular: true,
     },
     {
-      id: "elite", name: "Elite", price: 199, priceId: PRICE_IDS.elite,
-      features: ["3,333 leads/day (~100,000/mo)", "100 cities per job", "Email scraping included", "365-day history + API access"],
+      id: "elite", name: "Elite", price: 397, priceId: PRICE_IDS.elite,
+      features: [
+        "100,000 leads/month",
+        "3,333 leads per day",
+        "100 cities per job",
+        "Email scraping included",
+        "365-day history + API access",
+      ],
       popular: false,
+    },
+    {
+      id: "enterprise", name: "Enterprise", price: 1500, priceId: PRICE_IDS.enterprise,
+      features: [
+        "250,000+ leads/month",
+        "8,333+ leads per day",
+        "Unlimited cities per job",
+        "Email scraping included",
+        "Dedicated support + custom SLA",
+      ],
+      popular: false,
+      isEnterprise: true,
     },
   ];
 
-  // ═══════════════════════════════════════
-  //  AUTH LOADING
-  // ═══════════════════════════════════════
-  // Show signup page on /signup route
+  // ── Auth guards ──
   const isSignupRoute = window.location.pathname === "/signup";
   if (isSignupRoute && !session) {
-    return (
-      <Signup onSuccess={() => { window.location.href = "/"; }} />
-    );
+    return <Signup onSuccess={() => { window.location.href = "/"; }} />;
   }
 
   if (authLoading) return (
@@ -306,9 +333,7 @@ export default function App() {
     </div>
   );
 
-  // ═══════════════════════════════════════
-  //  LOGIN / FORGOT
-  // ═══════════════════════════════════════
+  // ── Login / Forgot ──
   if (!session) return (
     <div className="min-h-screen flex items-center justify-center px-4 relative overflow-hidden"
       style={{ background: "var(--bg)" }}>
@@ -397,7 +422,7 @@ export default function App() {
   return (
     <div className="min-h-screen flex" style={{ background: "var(--bg)" }}>
 
-      {/* ── Sidebar ── */}
+      {/* Sidebar */}
       <aside className="hidden lg:flex flex-col w-56 shrink-0 border-r py-5 px-3"
         style={{ background: "var(--bg-secondary)", borderColor: "var(--border)" }}>
         <div className="flex items-center gap-2.5 px-2 mb-8">
@@ -433,7 +458,7 @@ export default function App() {
         </div>
       </aside>
 
-      {/* ── Main ── */}
+      {/* Main */}
       <div className="flex-1 flex flex-col min-w-0">
 
         {/* Top bar */}
@@ -470,7 +495,7 @@ export default function App() {
             }}>{dashError}</div>
           )}
 
-          {/* ── DASHBOARD ── */}
+          {/* DASHBOARD */}
           {activeTab === "Dashboard" && (
             <div className="space-y-5 animate-fade-in">
               <div>
@@ -523,17 +548,16 @@ export default function App() {
             </div>
           )}
 
-          {/* ── SCRAPE LEADS ── */}
+          {/* SCRAPE LEADS */}
           {activeTab === "Scrape Leads" && <ScrapeLeads plan={plan} />}
 
-          {/* ── HISTORY ── */}
+          {/* HISTORY */}
           {activeTab === "History" && <History />}
 
-          {/* ── PLAN & BILLING ── */}
+          {/* PLAN & BILLING */}
           {activeTab === "Plan & Billing" && (
             <div className="space-y-5 animate-fade-in">
 
-              {/* Current plan */}
               {plan?.plan_name && (
                 <div className="card p-5">
                   <p className="label mb-4">Current Plan</p>
@@ -554,18 +578,13 @@ export default function App() {
                     ))}
                   </div>
                   <div className="pt-4">
-                    <button
-                      onClick={handleManageBilling}
-                      disabled={portalLoading}
-                      className="btn-ghost text-sm"
-                    >
+                    <button onClick={handleManageBilling} disabled={portalLoading} className="btn-ghost text-sm">
                       {portalLoading ? "Opening…" : "Manage billing via Stripe →"}
                     </button>
                   </div>
                 </div>
               )}
 
-              {/* Error */}
               {billingError && (
                 <div className="p-3 rounded-lg text-sm" style={{
                   background: "rgba(255,77,106,0.08)",
@@ -574,12 +593,12 @@ export default function App() {
                 }}>{billingError}</div>
               )}
 
-              {/* Plans */}
               <div>
                 <p className="label mb-3">
                   {plan?.plan_name ? "Upgrade / Change Plan" : "Choose a Plan"}
                 </p>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {/* 4 column grid for plans */}
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
                   {PLANS.map(p => (
                     <PricingCard
                       key={p.id}
@@ -591,6 +610,7 @@ export default function App() {
                       current={currentPlanId === p.id}
                       onBuy={handleBuyPlan}
                       loading={checkoutLoading}
+                      isEnterprise={p.isEnterprise}
                     />
                   ))}
                 </div>
@@ -599,7 +619,7 @@ export default function App() {
             </div>
           )}
 
-          {/* ── SETTINGS ── */}
+          {/* SETTINGS */}
           {activeTab === "Settings" && (
             <div className="space-y-4 animate-fade-in">
 
