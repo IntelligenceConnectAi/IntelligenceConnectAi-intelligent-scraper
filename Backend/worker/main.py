@@ -124,6 +124,40 @@ async def _poll_loop(pool: asyncpg.Pool) -> None:
         await asyncio.sleep(3)
 
 
+
+async def _watchdog_loop(pool: asyncpg.Pool) -> None:
+    """
+    Every 5 minutes: find jobs stuck in running with no update for 20+ minutes.
+    Auto-mark them failed so user can retry.
+    Handles power cuts, network drops, OOM crashes etc.
+    """
+    log.info("🐕 Watchdog started — checks every 5 min for stuck jobs (>20 min no update)")
+    while not _shutdown:
+        await asyncio.sleep(300)  # 5 minutes
+        try:
+            async with pool.acquire() as conn:
+                stuck = await conn.fetch(
+                    """
+                    UPDATE jobs
+                    SET status = 'failed',
+                        error_message = 'Job timed out — worker lost connection or crashed. Please retry.',
+                        updated_at = NOW()
+                    WHERE status = 'running'
+                      AND updated_at < NOW() - INTERVAL '10 minutes'
+                    RETURNING id, industry, state
+                    """
+                )
+                if stuck:
+                    for row in stuck:
+                        job_id = str(row["id"])
+                        _running.pop(job_id, None)
+                        log.warning(
+                            f"🐕 Watchdog auto-failed stuck job {job_id[:8]} "
+                            f"[{row['industry']} / {row['state']}]"
+                        )
+        except Exception as e:
+            log.error(f"Watchdog error: {e}")
+
 async def main() -> None:
     log.info("🚀 Intelligent Scraper Worker starting…")
     log.info(f"⚙️  Global concurrent job limit: {MAX_GLOBAL_CONCURRENT}")
@@ -149,7 +183,11 @@ async def main() -> None:
         except NotImplementedError:
             pass
 
-    await _poll_loop(pool)
+    # Run poll loop + watchdog concurrently
+    await asyncio.gather(
+        _poll_loop(pool),
+        _watchdog_loop(pool),
+    )
     await pool.close()
     log.info("Worker stopped.")
 
