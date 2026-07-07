@@ -1,8 +1,7 @@
 """
 Intelligent Scraper — Job Runner
-Based on best working local scrap.py logic.
-Maps scraping uses minimal flags (same as local).
-Email scraping uses full Docker flags.
+Uses playwright base image with full Chromium.
+Fresh browser per email site to avoid context closed errors.
 """
 
 import asyncio
@@ -46,25 +45,102 @@ LEGIT_TLDS = {
 }
 EMAIL_REGEX = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Z|a-z]{2,}\b")
 
-# Minimal flags for Maps scraping (same as local — avoids DOM rendering differences)
-MAPS_CHROMIUM_ARGS = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-]
-
-# Full flags for email scraping (Docker safe)
-EMAIL_CHROMIUM_ARGS = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--no-first-run",
-    "--disable-extensions",
-    "--disable-background-networking",
-    "--disable-default-apps",
-    "--mute-audio",
-]
+# JS extraction stored as raw string to avoid escape issues
+_EXTRACT_JS = r"""
+() => {
+    const phoneRegex = /(\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4})/;
+    const addressKeywords = [' St',' St,',' Ave',' Ave,',' Rd',' Rd,',' Blvd',' Dr',' Dr,',' Ln',' Ln,',' Way',' Ct',' Ct,',' Pl',' Pl,',' Hwy',' Pkwy',' Suite',' #',' Ste'];
+    function looksLikeAddress(txt) {
+        if (!txt || txt.length < 5) return false;
+        return /\d/.test(txt) && addressKeywords.some(kw => txt.includes(kw));
+    }
+    function looksLikePhone(txt) {
+        if (!txt) return false;
+        const m = txt.match(phoneRegex);
+        return m ? m[0] : null;
+    }
+    function isJunk(txt) {
+        if (!txt) return true;
+        const lower = txt.toLowerCase();
+        return /open|closed|hours/.test(lower) || txt.length < 5;
+    }
+    const results = [];
+    document.querySelectorAll('div[role="feed"] > div > div[jsaction]').forEach(card => {
+        const row = { name:'', category:'', rating:'', reviews:'', address:'', phone:'', website:'', maps_url:'' };
+        const nameEl = card.querySelector('.qBF1Pd');
+        if (nameEl) row.name = nameEl.innerText.trim();
+        if (!row.name) {
+            const mainLink = card.querySelector('a.hfpxzc');
+            if (mainLink) {
+                const label = mainLink.getAttribute('aria-label') || '';
+                if (label) row.name = label.trim();
+            }
+        }
+        if (!row.name) return;
+        const mapsEl = card.querySelector('a.hfpxzc');
+        if (mapsEl) row.maps_url = mapsEl.href || '';
+        const webEl = card.querySelector('a[data-value="Website"]');
+        if (webEl) row.website = webEl.href || '';
+        const catEl = card.querySelector('.W4Efsd .W4Efsd span');
+        if (catEl) row.category = catEl.innerText.trim();
+        const ratingEl = card.querySelector('.MW4etd');
+        if (ratingEl) row.rating = ratingEl.innerText.trim();
+        const revEl = card.querySelector('.UY7F9');
+        if (revEl) row.reviews = revEl.innerText.replace(/[()]/g,'').trim();
+        const allText = card.innerText || '';
+        if (!row.rating) {
+            const m = allText.match(/\b([1-4]\.[0-9]|5\.0)\b/);
+            if (m) row.rating = m[1];
+        }
+        if (!row.reviews) {
+            const m = allText.match(/\(([0-9,]+)\)/);
+            if (m) row.reviews = m[1].replace(/,/g,'');
+        }
+        card.querySelectorAll('[aria-label]').forEach(el => {
+            const label = (el.getAttribute('aria-label') || '').trim();
+            if (/^Address[\s:]/i.test(label) && !row.address) {
+                const addr = label.replace(/^Address[\s:]*/i,'').trim();
+                if (!isJunk(addr)) row.address = addr;
+            }
+            if (/^Phone[\s:]/i.test(label) && !row.phone) {
+                row.phone = label.replace(/^Phone[\s:]*/i,'').trim();
+            }
+        });
+        if (!row.address) {
+            const addrEl = card.querySelector('[data-item-id="address"]');
+            if (addrEl) {
+                const txt = (addrEl.getAttribute('aria-label') || addrEl.innerText || '').replace(/^Address[\s:]*/i,'').trim();
+                if (looksLikeAddress(txt)) row.address = txt;
+            }
+        }
+        if (!row.phone) {
+            const telEl = card.querySelector('a[href^="tel:"]');
+            if (telEl) row.phone = telEl.href.replace('tel:','').trim();
+        }
+        if (!row.address) {
+            const spans = card.querySelectorAll('.W4Efsd > span, .W4Efsd > div');
+            for (const span of spans) {
+                const txt = (span.innerText || '').split('\n')[0].trim();
+                if (looksLikeAddress(txt) && !isJunk(txt)) { row.address = txt; break; }
+            }
+        }
+        if (!row.phone) {
+            const spans = card.querySelectorAll('.W4Efsd span, .W4Efsd div');
+            for (const span of spans) {
+                const txt = (span.innerText || '').split('\n')[0].trim();
+                const ph = looksLikePhone(txt);
+                if (ph && txt.replace(/[\d\s\-\(\)\+]/g,'').length < 3) { row.phone = ph; break; }
+            }
+        }
+        if (!row.phone) {
+            const m = allText.match(phoneRegex);
+            if (m) row.phone = m[0];
+        }
+        results.push(row);
+    });
+    return results;
+}
+"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -201,120 +277,9 @@ async def _scroll_to_end(page):
                 for _ in range(3):
                     await page.evaluate('() => { const f = document.querySelector(\'div[role="feed"]\'); if (f) f.scrollTop = f.scrollHeight; }')
                     await asyncio.sleep(1.5)
-                final = await page.locator('div[role="feed"] > div > div[jsaction]').count()
-                return final
+                return await page.locator('div[role="feed"] > div > div[jsaction]').count()
         else:
             stable_count = 0; prev = cur
-
-
-async def _extract_cards(page):
-    """Exact same JS logic as working local scrap.py extract_all_at_once."""
-    data = await page.evaluate("""
-        () => {
-            const phoneRegex = /(\\(?\\d{3}\\)?[\\s\\-\\.]?\\d{3}[\\s\\-\\.]?\\d{4})/;
-            const addressKeywords = [' St',' St,',' Ave',' Ave,',' Rd',' Rd,',' Blvd',' Dr',' Dr,',' Ln',' Ln,',' Way',' Ct',' Ct,',' Pl',' Pl,',' Hwy',' Pkwy',' Suite',' #',' Ste'];
-            function looksLikeAddress(txt) {
-                if (!txt || txt.length < 5) return false;
-                return /\\d/.test(txt) && addressKeywords.some(kw => txt.includes(kw));
-            }
-            function looksLikePhone(txt) {
-                if (!txt) return false;
-                const m = txt.match(phoneRegex);
-                return m ? m[0] : null;
-            }
-            function isJunk(txt) {
-                if (!txt) return true;
-                const lower = txt.toLowerCase();
-                return /open|closed|hours|^\\d+(\\.\\d)?\\s*\\(/.test(lower) || txt.length < 5;
-            }
-            const results = [];
-            document.querySelectorAll('div[role="feed"] > div > div[jsaction]').forEach(card => {
-                const row = { name:'', category:'', rating:'', reviews:'', address:'', phone:'', website:'', maps_url:'' };
-
-                const nameEl = card.querySelector('.qBF1Pd');
-                if (nameEl) row.name = nameEl.innerText.trim();
-                if (!row.name) {
-                    const mainLink = card.querySelector('a.hfpxzc');
-                    if (mainLink) {
-                        const label = mainLink.getAttribute('aria-label') || '';
-                        if (label) row.name = label.trim();
-                    }
-                }
-                if (!row.name) return;
-
-                const catEl = card.querySelector('.W4Efsd .W4Efsd span');
-                if (catEl) row.category = catEl.innerText.trim();
-
-                const ratingEl = card.querySelector('.MW4etd');
-                if (ratingEl) row.rating = ratingEl.innerText.trim();
-
-                const revEl = card.querySelector('.UY7F9');
-                if (revEl) row.reviews = revEl.innerText.replace(/[()]/g,'').trim();
-
-                const webEl = card.querySelector('a[data-value="Website"]');
-                if (webEl) row.website = webEl.href || '';
-
-                const mapsEl = card.querySelector('a.hfpxzc');
-                if (mapsEl) row.maps_url = mapsEl.href || '';
-
-                card.querySelectorAll('[aria-label]').forEach(el => {
-                    const label = (el.getAttribute('aria-label') || '').trim();
-                    if (/^Address[:\\s]/i.test(label) && !row.address) {
-                        const addr = label.replace(/^Address[:\\s]*/i,'').trim();
-                        if (!isJunk(addr)) row.address = addr;
-                    }
-                    if (/^Phone[:\\s]/i.test(label) && !row.phone) {
-                        row.phone = label.replace(/^Phone[:\\s]*/i,'').trim();
-                    }
-                });
-
-                if (!row.address) {
-                    const addrEl = card.querySelector('[data-item-id="address"]');
-                    if (addrEl) {
-                        const txt = addrEl.getAttribute('aria-label') || addrEl.innerText || '';
-                        const clean = txt.replace(/^Address[:\\s]*/i,'').trim();
-                        if (looksLikeAddress(clean)) row.address = clean;
-                    }
-                }
-
-                if (!row.phone) {
-                    const telEl = card.querySelector('a[href^="tel:"]');
-                    if (telEl) row.phone = telEl.href.replace('tel:','').trim();
-                }
-
-                if (!row.address) {
-                    const spans = card.querySelectorAll('.W4Efsd > span, .W4Efsd > div');
-                    for (const span of spans) {
-                        const txt = span.innerText.split('\\n')[0].trim();
-                        if (looksLikeAddress(txt) && !isJunk(txt)) { row.address = txt; break; }
-                    }
-                }
-
-                if (!row.phone) {
-                    const spans = card.querySelectorAll('.W4Efsd span, .W4Efsd div');
-                    for (const span of spans) {
-                        const txt = span.innerText.split('\\n')[0].trim();
-                        const ph = looksLikePhone(txt);
-                        if (ph && txt.replace(/[\\d\\s\\-\\(\\)\\+]/g,'').length < 3) { row.phone = ph; break; }
-                    }
-                }
-
-                results.push(row);
-            });
-            return results;
-        }
-    """)
-    rows = []
-    for r in data:
-        if not r.get("name"): continue
-        rows.append({
-            "Name": r["name"], "Category": r.get("category", ""),
-            "Rating": r.get("rating", ""), "Reviews": r.get("reviews", ""),
-            "Address": clean_address(r.get("address", "")),
-            "Phone": format_phone(r.get("phone", "")),
-            "Email": "", "Website": r.get("website", ""), "Maps_URL": r.get("maps_url", ""),
-        })
-    return rows
 
 
 async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
@@ -344,7 +309,7 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
 
         try:
             await page.wait_for_selector('div[role="feed"]', timeout=15000)
-        except Exception as e:
+        except Exception:
             title = await page.title()
             print(f"[RUNNER] Feed not found for {city}. Title: {title}")
             await context.close()
@@ -356,7 +321,18 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
         print(f"[RUNNER] {city}: title={title}, cards_before_scroll={card_count}")
 
         await _scroll_to_end(page)
-        results = await _extract_cards(page)
+        data = await page.evaluate(_EXTRACT_JS)
+
+        for r in (data or []):
+            if not r.get("name"): continue
+            results.append({
+                "Name": r["name"], "Category": r.get("category", ""),
+                "Rating": r.get("rating", ""), "Reviews": r.get("reviews", ""),
+                "Address": clean_address(r.get("address", "")),
+                "Phone": format_phone(r.get("phone", "")),
+                "Email": "", "Website": r.get("website", ""), "Maps_URL": r.get("maps_url", ""),
+            })
+
         print(f"[RUNNER] {city}: found {len(results)} results")
 
         if results:
@@ -453,22 +429,22 @@ async def _extract_emails_from_page(page, is_homepage=False):
         try:
             header_text = await page.evaluate("""
                 () => {
-                    const h = document.querySelector('header, #header, .header, [class*="header"], [id*="header"], nav, .navbar');
+                    const h = document.querySelector('header, #header, .header, [class*="header"], nav');
                     return h ? h.innerText : '';
                 }
             """)
-            for e in EMAIL_REGEX.findall(header_text):
+            for e in EMAIL_REGEX.findall(header_text or ""):
                 if is_valid_email(e): found.add(clean_email(e))
         except: pass
 
         try:
             footer_text = await page.evaluate("""
                 () => {
-                    const f = document.querySelector('footer, #footer, .footer, [class*="footer"], [id*="footer"]');
+                    const f = document.querySelector('footer, #footer, .footer, [class*="footer"]');
                     return f ? f.innerText : '';
                 }
             """)
-            for e in EMAIL_REGEX.findall(footer_text):
+            for e in EMAIL_REGEX.findall(footer_text or ""):
                 if is_valid_email(e): found.add(clean_email(e))
         except: pass
 
@@ -485,7 +461,7 @@ async def _extract_emails_from_page(page, is_homepage=False):
     return found
 
 
-async def _crawl_site_for_email(context, start_url):
+async def _crawl_site_for_email(ctx, start_url):
     if not start_url or not start_url.startswith(("http://", "https://")):
         return ""
 
@@ -504,7 +480,7 @@ async def _crawl_site_for_email(context, start_url):
     async def visit(url, is_hp=False):
         if url in visited: return set()
         visited.add(url)
-        page = await context.new_page()
+        page = await ctx.new_page()
         try:
             await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,ico,mp4,mp3}", lambda r: r.abort())
             await page.set_extra_http_headers({
@@ -534,46 +510,54 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
     done    = [0]
     records = df.to_dict("records")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            slow_mo=0,
-            args=EMAIL_CHROMIUM_ARGS,
-        )
-
-        async def process_one(row):
-            if not str(row.get("Website", "")).strip(): return
+    async def process_one(row):
+        """Process one site — ALL exceptions caught, never propagates."""
+        if not str(row.get("Website", "")).strip():
+            return
+        row["Email"] = ""  # safe default
+        browser = None
+        try:
             async with semaphore:
-                ctx = await browser.new_context(
-                    viewport={"width": 1280, "height": 900},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-                )
+                p_instance = await async_playwright().start()
                 try:
+                    browser = await p_instance.chromium.launch(headless=True, slow_mo=0)
+                    ctx = await browser.new_context(
+                        viewport={"width": 1280, "height": 900},
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+                    )
                     row["Email"] = await asyncio.wait_for(
                         _crawl_site_for_email(ctx, row["Website"]),
                         timeout=EMAIL_CRAWL_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
                     print(f"[RUNNER] Timeout: {row.get('Website')}")
-                    row["Email"] = ""
                 except Exception as e:
-                    print(f"[RUNNER] Email error: {e}")
-                    row["Email"] = ""
+                    print(f"[RUNNER] Email error ({row.get('Website')}): {type(e).__name__}")
                 finally:
-                    try: await ctx.close()
+                    if browser:
+                        try: await browser.close()
+                        except: pass
+                    try: await p_instance.stop()
                     except: pass
+        except Exception as e:
+            print(f"[RUNNER] process_one outer error: {e}")
 
-                done[0] += 1
-                if done[0] % 10 == 0 or done[0] == total:
-                    found = sum(1 for r in records if r.get("Email"))
-                    print(f"[RUNNER] Email progress: {done[0]}/{total} | found: {found}")
-                    await _update_job(pool, job_id,
-                                      emails_attempted=done[0],
-                                      emails_found=found)
+        done[0] += 1
+        if done[0] % 10 == 0 or done[0] == total:
+            found = sum(1 for r in records if r.get("Email"))
+            print(f"[RUNNER] Email progress: {done[0]}/{total} | found: {found}")
+            try:
+                await _update_job(pool, job_id,
+                                  emails_attempted=done[0],
+                                  emails_found=found)
+            except Exception as e:
+                print(f"[RUNNER] DB update error: {e}")
 
-        await asyncio.gather(*[process_one(r) for r in records if str(r.get("Website","")).strip()])
-        await browser.close()
-
+    # return_exceptions=True ensures one crash never blocks others
+    await asyncio.gather(
+        *[process_one(r) for r in records if str(r.get("Website","")).strip()],
+        return_exceptions=True,
+    )
     return pd.DataFrame(records)
 
 
@@ -600,12 +584,9 @@ async def run_scrape_job(
     with tempfile.TemporaryDirectory() as tmpdir:
         out_dir = Path(tmpdir)
 
-        # ── STEP 1: Google Maps (no flags — same as local scrap.py) ──
+        # ── STEP 1: Google Maps ──
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                slow_mo=0,
-            )
+            browser = await p.chromium.launch(headless=True, slow_mo=0)
             total_raw = 0
             for i, city in enumerate(cities):
                 await _update_job(pool, job_id, current_city=city, cities_done=i)
