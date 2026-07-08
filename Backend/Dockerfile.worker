@@ -1,17 +1,11 @@
-FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
-
+FROM mcr.microsoft.com/playwright/python:v1.60.0-noble
 WORKDIR /app
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
-
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
 RUN playwright install chromium
-
 COPY app/    ./app/
 COPY worker/ ./worker/
-
 CMD ["python", "-m", "worker.main"]
