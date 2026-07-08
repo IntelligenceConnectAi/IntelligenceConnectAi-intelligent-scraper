@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install chromium
+RUN playwright install chrome
 COPY app/    ./app/
 COPY worker/ ./worker/
 CMD ["python", "-m", "worker.main"]
