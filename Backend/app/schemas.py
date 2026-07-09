@@ -111,6 +111,7 @@ class JobResponse(BaseModel):
     with_website: int = 0
     no_website: int = 0
     emails_found: int = 0
+    emails_attempted: int = 0
     error_message: Optional[str] = None
     created_at: datetime
     started_at: Optional[datetime] = None
