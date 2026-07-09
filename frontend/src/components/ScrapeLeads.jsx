@@ -180,7 +180,7 @@ function JobProgress({ jobId, onNewJob }) {
               <tr>
                 <th className="px-4 py-2.5 text-left text-xs font-medium tracking-wider uppercase"
                   style={{ color: "var(--text-3)" }}>City</th>
-                <th className="px-4 py-2.5 text-right label" style={{ marginBottom: 0 }}>Leads</th>
+                <th className="px-4 py-2.5 text-right label" style={{ marginBottom: 0 }}>Raw Leads</th>
                 <th className="px-4 py-2.5 text-left text-xs font-medium tracking-wider uppercase"
                   style={{ color: "var(--text-3)" }}>Status</th>
               </tr>
