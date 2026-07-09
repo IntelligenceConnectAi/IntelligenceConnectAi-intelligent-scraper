@@ -48,8 +48,6 @@ _EXTRACT_JS = r"""
 () => {
     const phoneRegex = /(\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4})/;
     const addressKeywords = [' St',' St,',' Ave',' Ave,',' Rd',' Rd,',' Blvd',' Dr',' Dr,',' Ln',' Ln,',' Way',' Ct',' Ct,',' Pl',' Pl,',' Hwy',' Pkwy',' Suite',' #',' Ste'];
-    const googleDomains = ['google.com','maps.google','goo.gl','maps.app','googleapis'];
-
     function looksLikeAddress(txt) {
         if (!txt || txt.length < 5) return false;
         return /\d/.test(txt) && addressKeywords.some(kw => txt.includes(kw));
@@ -64,11 +62,6 @@ _EXTRACT_JS = r"""
         const lower = txt.toLowerCase();
         return /open|closed|hours/.test(lower) || txt.length < 5;
     }
-    function isExternalLink(href) {
-        if (!href || !href.startsWith('http')) return false;
-        return !googleDomains.some(d => href.includes(d));
-    }
-
     const results = [];
     document.querySelectorAll('div[role="feed"] > div > div[jsaction]').forEach(card => {
         const row = { name:'', category:'', rating:'', reviews:'', address:'', phone:'', website:'', maps_url:'' };
@@ -89,7 +82,7 @@ _EXTRACT_JS = r"""
         const mapsEl = card.querySelector('a.hfpxzc');
         if (mapsEl) row.maps_url = mapsEl.href || '';
 
-        // ── Website: multiple selectors + fallback ──
+        // ── Website: multiple selectors ──
         const webSelectors = [
             'a[data-value="Website"]',
             'a[data-value="website"]',
@@ -97,21 +90,7 @@ _EXTRACT_JS = r"""
         ];
         for (const sel of webSelectors) {
             const el = card.querySelector(sel);
-            if (el && el.href && isExternalLink(el.href)) {
-                row.website = el.href;
-                break;
-            }
-        }
-        // Fallback: scan all links in card
-        if (!row.website) {
-            const links = card.querySelectorAll('a[href]');
-            for (const link of links) {
-                const href = link.href || '';
-                if (isExternalLink(href) && href !== row.maps_url) {
-                    row.website = href;
-                    break;
-                }
-            }
+            if (el && el.href) { row.website = el.href; break; }
         }
 
         // ── Category ──
