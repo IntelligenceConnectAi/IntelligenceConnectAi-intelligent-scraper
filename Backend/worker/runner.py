@@ -1,14 +1,12 @@
 """
 Intelligent Scraper — Job Runner
-Uses playwright base image with full Chromium.
-Fresh browser per email site to avoid context closed errors.
+Uses full Chrome (channel="chrome") instead of headless_shell.
 """
 
 import asyncio
 from datetime import datetime, timezone
 import csv
 import io
-import os
 import re
 import tempfile
 from pathlib import Path
@@ -50,6 +48,8 @@ _EXTRACT_JS = r"""
 () => {
     const phoneRegex = /(\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4})/;
     const addressKeywords = [' St',' St,',' Ave',' Ave,',' Rd',' Rd,',' Blvd',' Dr',' Dr,',' Ln',' Ln,',' Way',' Ct',' Ct,',' Pl',' Pl,',' Hwy',' Pkwy',' Suite',' #',' Ste'];
+    const googleDomains = ['google.com','maps.google','goo.gl','maps.app','googleapis'];
+
     function looksLikeAddress(txt) {
         if (!txt || txt.length < 5) return false;
         return /\d/.test(txt) && addressKeywords.some(kw => txt.includes(kw));
@@ -64,9 +64,16 @@ _EXTRACT_JS = r"""
         const lower = txt.toLowerCase();
         return /open|closed|hours/.test(lower) || txt.length < 5;
     }
+    function isExternalLink(href) {
+        if (!href || !href.startsWith('http')) return false;
+        return !googleDomains.some(d => href.includes(d));
+    }
+
     const results = [];
     document.querySelectorAll('div[role="feed"] > div > div[jsaction]').forEach(card => {
         const row = { name:'', category:'', rating:'', reviews:'', address:'', phone:'', website:'', maps_url:'' };
+
+        // ── Name ──
         const nameEl = card.querySelector('.qBF1Pd');
         if (nameEl) row.name = nameEl.innerText.trim();
         if (!row.name) {
@@ -77,17 +84,51 @@ _EXTRACT_JS = r"""
             }
         }
         if (!row.name) return;
+
+        // ── Maps URL ──
         const mapsEl = card.querySelector('a.hfpxzc');
         if (mapsEl) row.maps_url = mapsEl.href || '';
-        const webEl = card.querySelector('a[data-value="Website"]');
-        if (webEl) row.website = webEl.href || '';
+
+        // ── Website: multiple selectors + fallback ──
+        const webSelectors = [
+            'a[data-value="Website"]',
+            'a[data-value="website"]',
+            'a[data-item-id="authority"]',
+        ];
+        for (const sel of webSelectors) {
+            const el = card.querySelector(sel);
+            if (el && el.href && isExternalLink(el.href)) {
+                row.website = el.href;
+                break;
+            }
+        }
+        // Fallback: scan all links in card
+        if (!row.website) {
+            const links = card.querySelectorAll('a[href]');
+            for (const link of links) {
+                const href = link.href || '';
+                if (isExternalLink(href) && href !== row.maps_url) {
+                    row.website = href;
+                    break;
+                }
+            }
+        }
+
+        // ── Category ──
         const catEl = card.querySelector('.W4Efsd .W4Efsd span');
         if (catEl) row.category = catEl.innerText.trim();
+
+        // ── Rating ──
         const ratingEl = card.querySelector('.MW4etd');
         if (ratingEl) row.rating = ratingEl.innerText.trim();
+
+        // ── Reviews ──
         const revEl = card.querySelector('.UY7F9');
         if (revEl) row.reviews = revEl.innerText.replace(/[()]/g,'').trim();
+
+        // ── Full text for pattern fallbacks ──
         const allText = card.innerText || '';
+
         if (!row.rating) {
             const m = allText.match(/\b([1-4]\.[0-9]|5\.0)\b/);
             if (m) row.rating = m[1];
@@ -96,6 +137,8 @@ _EXTRACT_JS = r"""
             const m = allText.match(/\(([0-9,]+)\)/);
             if (m) row.reviews = m[1].replace(/,/g,'');
         }
+
+        // ── Address & Phone: aria-label first ──
         card.querySelectorAll('[aria-label]').forEach(el => {
             const label = (el.getAttribute('aria-label') || '').trim();
             if (/^Address[\s:]/i.test(label) && !row.address) {
@@ -106,6 +149,8 @@ _EXTRACT_JS = r"""
                 row.phone = label.replace(/^Phone[\s:]*/i,'').trim();
             }
         });
+
+        // ── Address fallback: data-item-id ──
         if (!row.address) {
             const addrEl = card.querySelector('[data-item-id="address"]');
             if (addrEl) {
@@ -113,10 +158,14 @@ _EXTRACT_JS = r"""
                 if (looksLikeAddress(txt)) row.address = txt;
             }
         }
+
+        // ── Phone fallback: tel: link ──
         if (!row.phone) {
             const telEl = card.querySelector('a[href^="tel:"]');
             if (telEl) row.phone = telEl.href.replace('tel:','').trim();
         }
+
+        // ── Address fallback: scan W4Efsd spans ──
         if (!row.address) {
             const spans = card.querySelectorAll('.W4Efsd > span, .W4Efsd > div');
             for (const span of spans) {
@@ -124,6 +173,8 @@ _EXTRACT_JS = r"""
                 if (looksLikeAddress(txt) && !isJunk(txt)) { row.address = txt; break; }
             }
         }
+
+        // ── Phone fallback: scan spans ──
         if (!row.phone) {
             const spans = card.querySelectorAll('.W4Efsd span, .W4Efsd div');
             for (const span of spans) {
@@ -132,10 +183,13 @@ _EXTRACT_JS = r"""
                 if (ph && txt.replace(/[\d\s\-\(\)\+]/g,'').length < 3) { row.phone = ph; break; }
             }
         }
+
+        // ── Phone final fallback: regex on full text ──
         if (!row.phone) {
             const m = allText.match(phoneRegex);
             if (m) row.phone = m[0];
         }
+
         results.push(row);
     });
     return results;
@@ -514,33 +568,36 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
         """Process one site — ALL exceptions caught, never propagates."""
         if not str(row.get("Website", "")).strip():
             return
-        row["Email"] = ""  # safe default
+        row["Email"] = ""
         browser = None
+        p_instance = None
         try:
             async with semaphore:
                 p_instance = await async_playwright().start()
-                try:
-                    browser = await p_instance.chromium.launch(headless=True, slow_mo=0)
-                    ctx = await browser.new_context(
-                        viewport={"width": 1280, "height": 900},
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-                    )
-                    row["Email"] = await asyncio.wait_for(
-                        _crawl_site_for_email(ctx, row["Website"]),
-                        timeout=EMAIL_CRAWL_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    print(f"[RUNNER] Timeout: {row.get('Website')}")
-                except Exception as e:
-                    print(f"[RUNNER] Email error ({row.get('Website')}): {type(e).__name__}")
-                finally:
-                    if browser:
-                        try: await browser.close()
-                        except: pass
-                    try: await p_instance.stop()
-                    except: pass
+                browser = await p_instance.chromium.launch(
+                    channel="chrome",
+                    headless=True,
+                    slow_mo=0,
+                )
+                ctx = await browser.new_context(
+                    viewport={"width": 1280, "height": 900},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+                )
+                row["Email"] = await asyncio.wait_for(
+                    _crawl_site_for_email(ctx, row["Website"]),
+                    timeout=EMAIL_CRAWL_TIMEOUT,
+                )
+        except asyncio.TimeoutError:
+            print(f"[RUNNER] Timeout: {row.get('Website')}")
         except Exception as e:
-            print(f"[RUNNER] process_one outer error: {e}")
+            print(f"[RUNNER] Email error ({row.get('Website')}): {type(e).__name__}")
+        finally:
+            if browser:
+                try: await browser.close()
+                except: pass
+            if p_instance:
+                try: await p_instance.stop()
+                except: pass
 
         done[0] += 1
         if done[0] % 10 == 0 or done[0] == total:
@@ -553,7 +610,6 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
             except Exception as e:
                 print(f"[RUNNER] DB update error: {e}")
 
-    # return_exceptions=True ensures one crash never blocks others
     await asyncio.gather(
         *[process_one(r) for r in records if str(r.get("Website","")).strip()],
         return_exceptions=True,
@@ -584,9 +640,13 @@ async def run_scrape_job(
     with tempfile.TemporaryDirectory() as tmpdir:
         out_dir = Path(tmpdir)
 
-        # ── STEP 1: Google Maps ──
+        # ── STEP 1: Google Maps (full Chrome) ──
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, slow_mo=0)
+            browser = await p.chromium.launch(
+                channel="chrome",
+                headless=True,
+                slow_mo=0,
+            )
             total_raw = 0
             for i, city in enumerate(cities):
                 await _update_job(pool, job_id, current_city=city, cities_done=i)
