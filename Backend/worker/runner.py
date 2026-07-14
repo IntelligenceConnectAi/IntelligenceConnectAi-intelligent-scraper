@@ -22,7 +22,7 @@ from playwright.async_api import async_playwright
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════
 MAX_CONCURRENT_SITES    = 5
-MAX_DETAIL_CONCURRENT   = 3   # concurrent Maps detail page visits
+MAX_DETAIL_CONCURRENT   = 10   # concurrent Maps detail page visits
 PAGE_TIMEOUT_MS         = 12000
 FOOTER_WAIT_MS          = 3000
 EMAIL_CRAWL_TIMEOUT     = 30.0
@@ -392,8 +392,8 @@ async def _fetch_missing_data(results: list, browser) -> list:
             page = await ctx.new_page()
             try:
                 await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,ico,mp4,mp3}", lambda r: r.abort())
-                await page.goto(row["Maps_URL"], timeout=20000, wait_until="domcontentloaded")
-                await asyncio.sleep(2)
+                await page.goto(row["Maps_URL"], timeout=8000, wait_until="domcontentloaded")
+                await asyncio.sleep(0.5)
                 data = await page.evaluate(_DETAIL_PAGE_JS)
                 if data.get("website") and not row.get("Website"):
                     row["Website"] = data["website"]
