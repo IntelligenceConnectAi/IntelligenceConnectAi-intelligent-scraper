@@ -465,10 +465,6 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
         print(f"[RUNNER] {city}: found {len(results)} results")
         await context.close()
 
-        # ── Fetch missing website/phone from detail pages ──
-        if results:
-            results = await _fetch_missing_data(results, browser)
-
         if results:
             fields = ["Name","Category","Rating","Reviews","Address","Phone","Email","Website","Maps_URL"]
             with open(out_file, "w", newline="", encoding="utf-8") as f:
@@ -727,11 +723,30 @@ async def run_scrape_job(
                 slow_mo=0,
             )
             total_raw = 0
+            all_results = []
             for i, city in enumerate(cities):
                 await _update_job(pool, job_id, current_city=city, cities_done=i)
                 rows = await _scrape_city(city, state, industry, browser, out_dir, pool, job_id)
                 total_raw += len(rows)
+                all_results.extend(rows)
                 await _update_job(pool, job_id, cities_done=i + 1, total_raw=total_raw)
+
+            # ── Fetch missing website/phone AFTER all cities ──
+            if all_results:
+                all_results = await _fetch_missing_data(all_results, browser)
+                # Re-save CSVs per city with updated data
+                from collections import defaultdict
+                by_city = defaultdict(list)
+                for r in all_results:
+                    city_name = r.get("City", "unknown")
+                    by_city[city_name].append(r)
+                for city_name, rows in by_city.items():
+                    city_file = out_dir / f"{sanitize(city_name)}_{state}.csv"
+                    fields = ["Name","Category","Rating","Reviews","Address","Phone","Email","Website","Maps_URL"]
+                    with open(city_file, "w", newline="", encoding="utf-8") as f:
+                        w = csv.DictWriter(f, fieldnames=fields)
+                        w.writeheader(); w.writerows(rows)
+
             await browser.close()
 
         await _update_job(pool, job_id, current_step="step2_preprocess", maps_done_at="NOW()")
