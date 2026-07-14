@@ -1,6 +1,8 @@
 """
 Intelligent Scraper — Job Runner
-Uses full Chrome (channel="chrome") instead of headless_shell.
+Uses full Chrome (channel="chrome").
+For businesses without website/phone in list view,
+visits Maps detail page to extract missing data.
 """
 
 import asyncio
@@ -19,10 +21,11 @@ from playwright.async_api import async_playwright
 # ═══════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════
-MAX_CONCURRENT_SITES = 5
-PAGE_TIMEOUT_MS      = 12000
-FOOTER_WAIT_MS       = 3000
-EMAIL_CRAWL_TIMEOUT  = 30.0
+MAX_CONCURRENT_SITES    = 5
+MAX_DETAIL_CONCURRENT   = 3   # concurrent Maps detail page visits
+PAGE_TIMEOUT_MS         = 12000
+FOOTER_WAIT_MS          = 3000
+EMAIL_CRAWL_TIMEOUT     = 30.0
 
 PRIORITY_PATHS = [
     "",
@@ -48,6 +51,7 @@ _EXTRACT_JS = r"""
 () => {
     const phoneRegex = /(\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4})/;
     const addressKeywords = [' St',' St,',' Ave',' Ave,',' Rd',' Rd,',' Blvd',' Dr',' Dr,',' Ln',' Ln,',' Way',' Ct',' Ct,',' Pl',' Pl,',' Hwy',' Pkwy',' Suite',' #',' Ste'];
+
     function looksLikeAddress(txt) {
         if (!txt || txt.length < 5) return false;
         return /\d/.test(txt) && addressKeywords.some(kw => txt.includes(kw));
@@ -62,6 +66,7 @@ _EXTRACT_JS = r"""
         const lower = txt.toLowerCase();
         return /open|closed|hours/.test(lower) || txt.length < 5;
     }
+
     const results = [];
     document.querySelectorAll('div[role="feed"] > div > div[jsaction]').forEach(card => {
         const row = { name:'', category:'', rating:'', reviews:'', address:'', phone:'', website:'', maps_url:'' };
@@ -144,7 +149,7 @@ _EXTRACT_JS = r"""
             if (telEl) row.phone = telEl.href.replace('tel:','').trim();
         }
 
-        // ── Address fallback: scan W4Efsd spans ──
+        // ── Address fallback: scan spans ──
         if (!row.address) {
             const spans = card.querySelectorAll('.W4Efsd > span, .W4Efsd > div');
             for (const span of spans) {
@@ -172,6 +177,56 @@ _EXTRACT_JS = r"""
         results.push(row);
     });
     return results;
+}
+"""
+
+# JS to extract website + phone from Maps detail page
+_DETAIL_PAGE_JS = r"""
+() => {
+    const phoneRegex = /(\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4})/;
+    const result = { website: '', phone: '' };
+
+    // Website
+    const webSelectors = [
+        'a[data-item-id="authority"]',
+        'a[data-tooltip="Open website"]',
+        'a[aria-label*="website" i]',
+    ];
+    for (const sel of webSelectors) {
+        const el = document.querySelector(sel);
+        if (el && el.href && !el.href.includes('google.com')) {
+            result.website = el.href;
+            break;
+        }
+    }
+
+    // Phone: aria-label
+    document.querySelectorAll('[aria-label]').forEach(el => {
+        const label = (el.getAttribute('aria-label') || '').trim();
+        if (/^Phone[\s:]/i.test(label) && !result.phone) {
+            result.phone = label.replace(/^Phone[\s:]*/i,'').trim();
+        }
+    });
+
+    // Phone: tel: link
+    if (!result.phone) {
+        const telEl = document.querySelector('a[href^="tel:"]');
+        if (telEl) result.phone = telEl.href.replace('tel:','').trim();
+    }
+
+    // Phone: button with phone number text
+    if (!result.phone) {
+        document.querySelectorAll('button, span').forEach(el => {
+            if (result.phone) return;
+            const txt = (el.innerText || '').trim();
+            const m = txt.match(phoneRegex);
+            if (m && txt.replace(/[\d\s\-\(\)\+]/g,'').length < 3) {
+                result.phone = m[0];
+            }
+        });
+    }
+
+    return result;
 }
 """
 
@@ -315,6 +370,47 @@ async def _scroll_to_end(page):
             stable_count = 0; prev = cur
 
 
+async def _fetch_missing_data(results: list, browser) -> list:
+    """
+    For businesses missing website or phone in list view,
+    visit their Maps detail page and extract the missing data.
+    Works for gyms, salons, restaurants etc.
+    """
+    missing = [r for r in results if (not r.get("Website") or not r.get("Phone")) and r.get("Maps_URL")]
+    if not missing:
+        return results
+
+    print(f"[RUNNER] Fetching detail pages for {len(missing)} businesses missing website/phone")
+    semaphore = asyncio.Semaphore(MAX_DETAIL_CONCURRENT)
+
+    async def fetch_one(row):
+        async with semaphore:
+            ctx = await browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+            )
+            page = await ctx.new_page()
+            try:
+                await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,ico,mp4,mp3}", lambda r: r.abort())
+                await page.goto(row["Maps_URL"], timeout=20000, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                data = await page.evaluate(_DETAIL_PAGE_JS)
+                if data.get("website") and not row.get("Website"):
+                    row["Website"] = data["website"]
+                    print(f"[RUNNER] Detail page website: {row['Name']} → {data['website']}")
+                if data.get("phone") and not row.get("Phone"):
+                    row["Phone"] = format_phone(data["phone"])
+                    print(f"[RUNNER] Detail page phone: {row['Name']} → {data['phone']}")
+            except Exception as e:
+                print(f"[RUNNER] Detail page error for {row.get('Name')}: {e}")
+            finally:
+                try: await ctx.close()
+                except: pass
+
+    await asyncio.gather(*[fetch_one(r) for r in missing], return_exceptions=True)
+    return results
+
+
 async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
     query = f"{industry} in {city}, {state}"
     out_file = out_dir / f"{sanitize(city)}_{state}.csv"
@@ -367,6 +463,11 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
             })
 
         print(f"[RUNNER] {city}: found {len(results)} results")
+        await context.close()
+
+        # ── Fetch missing website/phone from detail pages ──
+        if results:
+            results = await _fetch_missing_data(results, browser)
 
         if results:
             fields = ["Name","Category","Rating","Reviews","Address","Phone","Email","Website","Maps_URL"]
@@ -376,10 +477,10 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
 
     except Exception as e:
         print(f"[RUNNER] Error scraping {city}: {e}")
+        try: await context.close()
+        except: pass
         await _update_city(pool, job_id, city, maps_status="failed", error=str(e)[:200])
         return []
-    finally:
-        await context.close()
 
     await _update_city(pool, job_id, city, maps_status="done",
                        maps_leads=len(results), maps_done_at="NOW()")
@@ -544,7 +645,6 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
     records = df.to_dict("records")
 
     async def process_one(row):
-        """Process one site — ALL exceptions caught, never propagates."""
         if not str(row.get("Website", "")).strip():
             return
         row["Email"] = ""
