@@ -685,8 +685,16 @@ async def _enrich_and_email(all_df: pd.DataFrame, pool: asyncpg.Pool, job_id: st
                 except Exception as e:
                     print(f"[RUNNER] DB update error: {e}")
 
+    async def safe_process(r):
+        try:
+            await asyncio.wait_for(process_one(r), timeout=60.0)
+        except asyncio.TimeoutError:
+            print(f"[RUNNER] Task timeout for {r.get('Name', 'unknown')}")
+        except Exception as e:
+            print(f"[RUNNER] Task error: {e}")
+
     await asyncio.gather(
-        *[process_one(r) for r in records],
+        *[safe_process(r) for r in records],
         return_exceptions=True,
     )
     return pd.DataFrame(records)
@@ -751,7 +759,14 @@ async def run_scrape_job(
 
             # Merge ALL records — enrich missing + email in one pass
             all_df = pd.concat([with_web_df, no_web_df], ignore_index=True)
-            all_df = await _enrich_and_email(all_df, pool, job_id)
+            try:
+                all_df = await asyncio.wait_for(
+                    _enrich_and_email(all_df, pool, job_id),
+                    timeout=900.0  # 15 min max for entire enrich phase
+                )
+            except asyncio.TimeoutError:
+                print("[RUNNER] Enrich phase timed out — saving partial results")
+                # all_df already has partial updates since records are mutated in place
 
             # Re-split after enrichment
             with_web_df = all_df[all_df["Website"].astype(str).str.strip() != ""].copy()
