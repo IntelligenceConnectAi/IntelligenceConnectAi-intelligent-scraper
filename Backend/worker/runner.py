@@ -632,17 +632,17 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
             if p_instance:
                 try: await p_instance.stop()
                 except: pass
-
-        done[0] += 1
-        if done[0] % 10 == 0 or done[0] == total:
-            found = sum(1 for r in records if r.get("Email"))
-            print(f"[RUNNER] Email progress: {done[0]}/{total} | found: {found}")
-            try:
-                await _update_job(pool, job_id,
-                                  emails_attempted=done[0],
-                                  emails_found=found)
-            except Exception as e:
-                print(f"[RUNNER] DB update error: {e}")
+            # Always increment — even if browser crashed
+            done[0] += 1
+            if done[0] % 10 == 0 or done[0] == total:
+                found = sum(1 for r in records if r.get("Email"))
+                print(f"[RUNNER] Email progress: {done[0]}/{total} | found: {found}")
+                try:
+                    await _update_job(pool, job_id,
+                                      emails_attempted=done[0],
+                                      emails_found=found)
+                except Exception as e:
+                    print(f"[RUNNER] DB update error: {e}")
 
     async def safe_process(r):
         try:
