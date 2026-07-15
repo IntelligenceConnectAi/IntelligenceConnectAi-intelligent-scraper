@@ -21,7 +21,7 @@ from playwright.async_api import async_playwright
 # ═══════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════
-MAX_CONCURRENT_SITES = 5
+MAX_CONCURRENT_SITES = 2
 PAGE_TIMEOUT_MS      = 12000
 FOOTER_WAIT_MS       = 3000
 EMAIL_CRAWL_TIMEOUT  = 45.0   # per business (includes Maps detail + email)
