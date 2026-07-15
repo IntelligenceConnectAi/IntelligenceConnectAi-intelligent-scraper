@@ -646,9 +646,7 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
 
     async def safe_process(r):
         try:
-            await asyncio.wait_for(process_one(r), timeout=60.0)
-        except asyncio.TimeoutError:
-            print(f"[RUNNER] Task timeout: {r.get('Name')}")
+            await process_one(r)
         except Exception as e:
             print(f"[RUNNER] Task error: {e}")
 
