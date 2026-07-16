@@ -611,7 +611,16 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
             async with semaphore:
                 p_instance = await async_playwright().start()
                 browser = await p_instance.chromium.launch(
-                    channel="chrome", headless=True, slow_mo=0,
+                    channel="chrome",
+                    headless=True,
+                    slow_mo=0,
+                    args=[
+                        "--ignore-certificate-errors",
+                        "--ignore-ssl-errors",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                    ],
                 )
                 ctx = await browser.new_context(
                     viewport={"width": 1280, "height": 900},
