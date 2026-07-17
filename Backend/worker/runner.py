@@ -644,21 +644,23 @@ async def _crawl_site_for_email(ctx, start_url):
 
 
 async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.DataFrame:
+    """
+    Email scraping using a BROWSER POOL.
+    Launch MAX_CONCURRENT_EMAIL browsers once — reuse them across all sites.
+    Each site gets a fresh context within a shared browser.
+    This avoids forking hundreds of Chrome processes (BlockingIOError fix).
+    """
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_EMAIL)
-    total   = len(df)
-    done    = [0]
-    records = df.to_dict("records")
+    total     = len(df)
+    done      = [0]
+    records   = df.to_dict("records")
 
-    async def process_one(row):
-        if not str(row.get("Website", "")).strip():
-            return
-        row["Email"] = ""
-        browser    = None
-        p_instance = None
-        try:
-            async with semaphore:
-                p_instance = await async_playwright().start()
-                browser = await p_instance.chromium.launch(
+    async with async_playwright() as p:
+        # ── Launch browser pool once ──
+        browsers = []
+        for _ in range(MAX_CONCURRENT_EMAIL):
+            try:
+                b = await p.chromium.launch(
                     channel="chrome",
                     headless=True,
                     slow_mo=0,
@@ -670,47 +672,97 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                         "--disable-gpu",
                     ],
                 )
-                ctx = await browser.new_context(
-                    viewport={"width": 1280, "height": 900},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-                )
-                row["Email"] = await asyncio.wait_for(
-                    _crawl_site_for_email(ctx, row["Website"]),
-                    timeout=EMAIL_CRAWL_TIMEOUT,
-                )
-        except asyncio.TimeoutError:
-            print(f"[RUNNER] Email timeout: {row.get('Website')}")
-        except Exception as e:
-            print(f"[RUNNER] Email error: {type(e).__name__}")
-        finally:
-            if browser:
-                try: await browser.close()
-                except: pass
-            if p_instance:
-                try: await p_instance.stop()
-                except: pass
-            # Always increment — even on crash
-            done[0] += 1
-            if done[0] % 10 == 0 or done[0] == total:
-                found = sum(1 for r in records if r.get("Email"))
-                print(f"[RUNNER] Email progress: {done[0]}/{total} | found: {found}")
-                try:
-                    await _update_job(pool, job_id,
-                                      emails_attempted=done[0],
-                                      emails_found=found)
-                except Exception as e:
-                    print(f"[RUNNER] DB update error: {e}")
+                browsers.append(b)
+            except Exception as e:
+                print(f"[RUNNER] Browser launch failed: {e}")
 
-    async def safe_process(r):
-        try:
-            await process_one(r)
-        except Exception as e:
-            print(f"[RUNNER] Task error: {e}")
+        if not browsers:
+            print("[RUNNER] No browsers available for email scraping")
+            return pd.DataFrame(records)
 
-    await asyncio.gather(
-        *[safe_process(r) for r in records if str(r.get("Website","")).strip()],
-        return_exceptions=True,
-    )
+        print(f"[RUNNER] Email browser pool: {len(browsers)} browsers ready")
+
+        # Round-robin browser assignment
+        browser_idx = [0]
+        browser_lock = asyncio.Lock()
+
+        async def get_browser():
+            async with browser_lock:
+                b = browsers[browser_idx[0] % len(browsers)]
+                browser_idx[0] += 1
+                return b
+
+        async def process_one(row):
+            if not str(row.get("Website", "")).strip():
+                return
+            row["Email"] = ""
+            ctx = None
+            try:
+                async with semaphore:
+                    browser = await get_browser()
+                    # If browser is closed, launch a new one
+                    try:
+                        ctx = await browser.new_context(
+                            viewport={"width": 1280, "height": 900},
+                            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+                        )
+                    except Exception:
+                        # Browser crashed — launch fresh one
+                        try:
+                            new_b = await p.chromium.launch(
+                                channel="chrome", headless=True, slow_mo=0,
+                                args=["--ignore-certificate-errors","--ignore-ssl-errors",
+                                      "--no-sandbox","--disable-dev-shm-usage","--disable-gpu"],
+                            )
+                            browsers.append(new_b)
+                            ctx = await new_b.new_context(
+                                viewport={"width": 1280, "height": 900},
+                                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+                            )
+                        except Exception as e:
+                            print(f"[RUNNER] Browser recovery failed: {e}")
+                            done[0] += 1
+                            return
+
+                    row["Email"] = await asyncio.wait_for(
+                        _crawl_site_for_email(ctx, row["Website"]),
+                        timeout=EMAIL_CRAWL_TIMEOUT,
+                    )
+            except asyncio.TimeoutError:
+                print(f"[RUNNER] Email timeout: {row.get('Website')}")
+            except Exception as e:
+                print(f"[RUNNER] Email error: {type(e).__name__}")
+            finally:
+                if ctx:
+                    try: await ctx.close()
+                    except: pass
+                done[0] += 1
+                if done[0] % 10 == 0 or done[0] == total:
+                    found = sum(1 for r in records if r.get("Email"))
+                    print(f"[RUNNER] Email progress: {done[0]}/{total} | found: {found}")
+                    try:
+                        await _update_job(pool, job_id,
+                                          emails_attempted=done[0],
+                                          emails_found=found)
+                    except Exception as e:
+                        print(f"[RUNNER] DB update error: {e}")
+
+        async def safe_process(r):
+            try:
+                await process_one(r)
+            except Exception as e:
+                print(f"[RUNNER] Task error: {e}")
+
+        await asyncio.gather(
+            *[safe_process(r) for r in records if str(r.get("Website","")).strip()],
+            return_exceptions=True,
+        )
+
+        # Close all browsers
+        for b in browsers:
+            try: await b.close()
+            except: pass
+
     return pd.DataFrame(records)
 
 
