@@ -143,7 +143,7 @@ async def _watchdog_loop(pool: asyncpg.Pool) -> None:
                         error_message = 'Job timed out — worker lost connection or crashed. Please retry.',
                         updated_at = NOW()
                     WHERE status = 'running'
-                      AND updated_at < NOW() - INTERVAL '30 minutes'
+                      AND updated_at < NOW() - INTERVAL '45 minutes'
                     RETURNING id, industry, state
                     """
                 )
