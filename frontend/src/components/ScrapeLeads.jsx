@@ -46,6 +46,13 @@ function JobProgress({ jobId, onNewJob }) {
   const [error, setError] = useState("");
   const timer             = useRef(null);
 
+  // ── FIX 1: Persist job data in localStorage so tab switch doesn't lose state ──
+  useEffect(() => {
+    if (jobId) {
+      localStorage.setItem("active_job_id", jobId);
+    }
+  }, [jobId]);
+
   const fetchJob = async () => {
     try {
       const d = await api.getJob(jobId);
@@ -75,6 +82,11 @@ function JobProgress({ jobId, onNewJob }) {
     catch (e) { setError(e.message); }
   };
 
+  const handleNewJob = () => {
+    localStorage.removeItem("active_job_id");
+    onNewJob();
+  };
+
   if (error) return (
     <div className="p-3 rounded-lg text-sm" style={{
       background: "rgba(255,77,106,0.08)",
@@ -87,25 +99,22 @@ function JobProgress({ jobId, onNewJob }) {
     <div className="text-sm animate-soft-pulse" style={{ color: "var(--text-3)" }}>Loading job…</div>
   );
 
-  const isComplete  = job.status === "done";
-  const isFailed    = job.status === "failed";
-  const isCanceled  = job.status === "canceled";
-  const isRunning   = !isComplete && !isFailed && !isCanceled;
+  const isComplete = job.status === "done";
+  const isFailed   = job.status === "failed";
+  const isCanceled = job.status === "canceled";
+  const isRunning  = !isComplete && !isFailed && !isCanceled;
 
   const pct = job.cities_total > 0
     ? Math.round((job.cities_done / job.cities_total) * 100)
     : 0;
 
-  // ── FIX 1: Email progress — use emails_attempted & with_website ──
-  const emailsTotal    = job.with_website   ?? 0;
+  const emailsTotal     = job.with_website    ?? 0;
   const emailsAttempted = job.emails_attempted ?? 0;
-  const emailsFound    = job.emails_found   ?? 0;
-  const emailsPct      = emailsTotal > 0
+  const emailsFound     = job.emails_found    ?? 0;
+  const emailsPct       = emailsTotal > 0
     ? Math.round((emailsAttempted / emailsTotal) * 100)
     : 0;
-  const emailsRunning  = isRunning && job.current_step === "step3_emails";
-
-  // ── Displayed status ──
+  const emailsRunning = isRunning && job.current_step === "step3_emails";
   const displayStatus = emailsRunning ? "email_scraping" : job.status;
 
   return (
@@ -124,7 +133,7 @@ function JobProgress({ jobId, onNewJob }) {
         <StatusBadge status={displayStatus} />
       </div>
 
-      {/* Step bar — show until complete */}
+      {/* Step bar */}
       {isRunning && <StepBar step={job.current_step} />}
 
       {/* Maps progress */}
@@ -144,7 +153,7 @@ function JobProgress({ jobId, onNewJob }) {
         </div>
       )}
 
-      {/* ── FIX 1: Email progress bar updates correctly ── */}
+      {/* Email progress */}
       {(emailsRunning || (isComplete && emailsTotal > 0)) && (
         <div>
           <div className="flex justify-between text-xs mb-2" style={{ color: "var(--text-2)" }}>
@@ -157,20 +166,22 @@ function JobProgress({ jobId, onNewJob }) {
         </div>
       )}
 
-      {/* Stats */}
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        {[
-          { label: "Total leads",  value: job.total_clean  ?? 0 },
-          { label: "With website", value: emailsTotal },
-          { label: "No website",   value: job.no_website   ?? 0 },
-          { label: "Emails found", value: emailsFound },
-        ].map(s => (
-          <div key={s.label} className="card p-3 text-center">
-            <p className="stat-number text-2xl">{s.value}</p>
-            <p className="text-xs mt-1" style={{ color: "var(--text-3)" }}>{s.label}</p>
-          </div>
-        ))}
-      </div>
+      {/* ── FIX 2: KPIs only show when job is DONE ── */}
+      {isComplete && (
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          {[
+            { label: "Total leads",  value: job.total_clean  ?? 0 },
+            { label: "With website", value: emailsTotal },
+            { label: "No website",   value: job.no_website   ?? 0 },
+            { label: "Emails found", value: emailsFound },
+          ].map(s => (
+            <div key={s.label} className="card p-3 text-center">
+              <p className="stat-number text-2xl">{s.value}</p>
+              <p className="text-xs mt-1" style={{ color: "var(--text-3)" }}>{s.label}</p>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* City table */}
       {job.city_progress?.length > 0 && (
@@ -218,7 +229,7 @@ function JobProgress({ jobId, onNewJob }) {
         }}>{job.error_message}</div>
       )}
 
-      {/* ── FIX 2: Download buttons stay on same page after completion ── */}
+      {/* Action buttons */}
       <div className="flex flex-wrap gap-2">
         {isComplete && (
           <>
@@ -233,9 +244,8 @@ function JobProgress({ jobId, onNewJob }) {
         {isRunning && (
           <button onClick={cancel} className="btn-danger">Cancel job</button>
         )}
-        {/* New Job button — only shows after done/failed/canceled */}
         {(isComplete || isFailed || isCanceled) && (
-          <button onClick={onNewJob} className="btn-ghost">
+          <button onClick={handleNewJob} className="btn-ghost">
             ← New Job
           </button>
         )}
@@ -247,20 +257,18 @@ function JobProgress({ jobId, onNewJob }) {
 export default function ScrapeLeads({ plan }) {
   const [industry, setIndustry]       = useState("");
   const [state, setState]             = useState("");
-  const [cityText, setCityText]       = useState("");   // textarea raw text
-  const [cities, setCities]           = useState([]);   // confirmed city tags
+  const [cityText, setCityText]       = useState("");
+  const [cities, setCities]           = useState([]);
   const [loading, setLoading]         = useState(false);
   const [error, setError]             = useState("");
-  const [activeJobId, setActiveJobId] = useState(null);
+  const [activeJobId, setActiveJobId] = useState(() => {
+    // ── FIX 1: Restore active job from localStorage on mount ──
+    return localStorage.getItem("active_job_id") || null;
+  });
 
   const maxCities = plan?.cities_per_job ?? 10;
 
-  // ── FIX 3: City input logic ──
-  // cityText = what user is typing right now (single city)
-  // cities   = list of confirmed cities (shown as tags)
-
   const commitCity = (text) => {
-    // Split by comma in case user pastes "Miami, Tampa"
     const parts = text.split(",").map(c => c.trim()).filter(Boolean);
     if (!parts.length) return;
     setCities(prev => {
@@ -273,7 +281,6 @@ export default function ScrapeLeads({ plan }) {
 
   const handleCityChange = (e) => {
     const val = e.target.value;
-    // If user typed a comma, treat everything before comma as a committed city
     if (val.includes(",")) {
       const parts = val.split(",");
       const toCommit = parts.slice(0, -1).join(",");
@@ -290,7 +297,6 @@ export default function ScrapeLeads({ plan }) {
       e.preventDefault();
       if (cityText.trim()) commitCity(cityText);
     }
-    // Backspace on empty input removes last tag
     if (e.key === "Backspace" && !cityText && cities.length > 0) {
       setCities(prev => prev.slice(0, -1));
     }
@@ -302,14 +308,13 @@ export default function ScrapeLeads({ plan }) {
 
   const submit = async (e) => {
     e.preventDefault();
-    // Commit any remaining text before submitting
     const allCities = cityText.trim()
       ? [...new Set([...cities, ...cityText.split(",").map(c => c.trim()).filter(Boolean)])].slice(0, maxCities)
       : cities;
 
-    if (!industry.trim())      { setError("Industry is required"); return; }
-    if (!state.trim())         { setError("State abbreviation is required"); return; }
-    if (allCities.length === 0){ setError("Add at least one city"); return; }
+    if (!industry.trim())       { setError("Industry is required"); return; }
+    if (!state.trim())          { setError("State abbreviation is required"); return; }
+    if (allCities.length === 0) { setError("Add at least one city"); return; }
 
     setLoading(true); setError("");
     try {
@@ -352,7 +357,6 @@ export default function ScrapeLeads({ plan }) {
                 </span>
               </label>
 
-              {/* Tags + input in one box */}
               <div className="input min-h-[80px] flex flex-wrap gap-1.5 items-start content-start cursor-text"
                 style={{ padding: "8px 12px" }}
                 onClick={() => document.getElementById("city-input").focus()}>
