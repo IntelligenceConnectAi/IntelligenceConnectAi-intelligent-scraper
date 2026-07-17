@@ -1,10 +1,7 @@
 """
 Intelligent Scraper — Job Runner
 Uses full Chrome (channel="chrome").
-3 separate phases to minimize RAM usage:
-1. Maps scraping
-2. Detail page enrichment (website/phone for missing businesses)
-3. Email scraping
+3 separate phases: Maps → Enrich → Email
 """
 
 import asyncio
@@ -23,13 +20,12 @@ from playwright.async_api import async_playwright
 # ═══════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════
-MAX_CONCURRENT_MAPS   = 1   # one city at a time (browser reused)
-MAX_CONCURRENT_DETAIL = 3   # detail page concurrent visits
-MAX_CONCURRENT_EMAIL  = 3   # email scraping concurrent
-PAGE_TIMEOUT_MS       = 12000
+MAX_CONCURRENT_DETAIL = 3
+MAX_CONCURRENT_EMAIL  = 3
+PAGE_TIMEOUT_MS       = 15000
 FOOTER_WAIT_MS        = 3000
 EMAIL_CRAWL_TIMEOUT   = 30.0
-MAPS_DETAIL_TIMEOUT   = 8.0
+MAPS_DETAIL_TIMEOUT   = 10.0
 
 PRIORITY_PATHS = [
     "",
@@ -328,35 +324,46 @@ async def _update_city(pool: asyncpg.Pool, job_id: str, city: str, **kwargs):
 #  PHASE 1 — GOOGLE MAPS SCRAPING
 # ═══════════════════════════════════════════════════════════════
 async def _scroll_to_end(page):
-    prev = 0; stable_count = 0
+    """Improved scroll — waits longer and checks for end more reliably."""
+    prev = 0
+    stable_count = 0
+    max_stable = 8  # more attempts before giving up
+
     while True:
+        # Scroll feed
         await page.evaluate("""
             () => {
                 const f = document.querySelector('div[role="feed"]');
-                if (f) { f.scrollTop = f.scrollHeight; f.scrollBy(0, 3000); }
+                if (f) { f.scrollTop = f.scrollHeight; f.scrollBy(0, 5000); }
             }
         """)
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(1.5)  # more wait time
+
         cur = await page.locator('div[role="feed"] > div > div[jsaction]').count()
         html = await page.content()
+
         if "You've reached the end" in html or "end of the list" in html:
-            for _ in range(2):
+            # Extra scroll to load any final items
+            for _ in range(3):
                 await page.evaluate('() => { const f = document.querySelector(\'div[role="feed"]\'); if (f) f.scrollTop = f.scrollHeight; }')
                 await asyncio.sleep(1.0)
             return
+
         if cur == prev:
             stable_count += 1
-            if stable_count >= 6:
-                for _ in range(3):
+            if stable_count >= max_stable:
+                # Final push
+                for _ in range(4):
                     await page.evaluate('() => { const f = document.querySelector(\'div[role="feed"]\'); if (f) f.scrollTop = f.scrollHeight; }')
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(2.0)
                 return
         else:
-            stable_count = 0; prev = cur
+            stable_count = 0
+        prev = cur
 
 
 async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
-    query   = f"{industry} in {city}, {state}"
+    query    = f"{industry} in {city}, {state}"
     out_file = out_dir / f"{sanitize(city)}_{state}.csv"
 
     await _update_city(pool, job_id, city, maps_status="running", maps_started_at="NOW()")
@@ -372,16 +379,17 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
     try:
         url = "https://www.google.com/maps/search/" + query.replace(" ", "+")
         await page.goto(url, timeout=45000, wait_until="domcontentloaded")
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)  # more initial wait
 
         try:
             btn = page.locator('button:has-text("Accept all")').first
             if await btn.is_visible(timeout=2000):
-                await btn.click(); await asyncio.sleep(0.5)
+                await btn.click(); await asyncio.sleep(1)
         except: pass
 
         try:
-            await page.wait_for_selector('div[role="feed"]', timeout=15000)
+            await page.wait_for_selector('div[role="feed"]', timeout=20000)
+            await asyncio.sleep(2)  # wait for feed to fully render
         except Exception:
             title = await page.title()
             print(f"[RUNNER] Feed not found for {city}. Title: {title}")
@@ -389,11 +397,14 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
             await _update_city(pool, job_id, city, maps_status="done", maps_leads=0)
             return []
 
-        title = await page.title()
+        title     = await page.title()
         card_count = await page.locator('div[role="feed"] > div > div[jsaction]').count()
         print(f"[RUNNER] {city}: title={title}, cards_before_scroll={card_count}")
 
         await _scroll_to_end(page)
+
+        # Extra wait after scroll to ensure all cards loaded
+        await asyncio.sleep(2)
         data = await page.evaluate(_EXTRACT_JS)
 
         for r in (data or []):
@@ -431,14 +442,57 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  PREPROCESS
+# ═══════════════════════════════════════════════════════════════
+def _preprocess(folder_path: Path, state: str, industry: str):
+    import glob
+    all_files = glob.glob(str(folder_path / "*.csv"))
+    if not all_files:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df_list = []
+    for f in all_files:
+        try:
+            df = pd.read_csv(f, encoding="latin1")
+            if "City" not in df.columns:
+                df["City"] = Path(f).stem.replace(f"_{state}", "").replace("_", " ")
+            df_list.append(df)
+        except Exception:
+            continue
+
+    if not df_list:
+        return pd.DataFrame(), pd.DataFrame()
+
+    merged = pd.concat(df_list, ignore_index=True)
+    cols = ["Name","Category","City","Rating","Reviews","Address","Phone","Email","Website","Maps_URL"]
+    merged = merged[[c for c in cols if c in merged.columns]]
+    merged = merged.loc[:, ~merged.columns.str.contains("^Unnamed")].dropna(how="all")
+    for col in merged.columns:
+        merged[col] = merged[col].fillna("").astype(str).str.strip()
+    if "Phone"   in merged.columns: merged["Phone"]   = merged["Phone"].apply(format_phone)
+    if "Address" in merged.columns: merged["Address"] = merged["Address"].apply(clean_address)
+
+    name_cities = merged.groupby("Name")["City"].apply(
+        lambda x: ", ".join(sorted(set(c.strip() for c in x if c.strip())))
+    ).to_dict()
+    name_count = merged.groupby("Name")["Name"].count().to_dict()
+    merged["Times_Found"]     = merged["Name"].map(lambda n: name_count.get(n, 1))
+    merged["Found_In_Cities"] = merged["Name"].map(lambda n: name_cities.get(n, ""))
+
+    has_phone = merged[merged["Phone"] != ""].copy()
+    no_phone  = merged[merged["Phone"] == ""].copy()
+    has_phone = has_phone.drop_duplicates(subset=["Name","Phone"], keep="first")
+    merged    = pd.concat([has_phone, no_phone], ignore_index=True).sort_values(["City","Name"]).reset_index(drop=True)
+
+    no_web   = merged[merged["Website"] == ""].copy()
+    with_web = merged[merged["Website"] != ""].copy()
+    return with_web, no_web
+
+
+# ═══════════════════════════════════════════════════════════════
 #  PHASE 2 — DETAIL PAGE ENRICHMENT
 # ═══════════════════════════════════════════════════════════════
 async def _enrich_missing(records: list, pool: asyncpg.Pool, job_id: str) -> list:
-    """
-    For businesses missing website OR phone:
-    visit Maps detail page and extract them.
-    Uses a single shared browser — sequential processing for low RAM.
-    """
     missing = [r for r in records if
                (not str(r.get("Website","")).strip() or not str(r.get("Phone","")).strip())
                and str(r.get("Maps_URL","")).strip()]
@@ -447,7 +501,7 @@ async def _enrich_missing(records: list, pool: asyncpg.Pool, job_id: str) -> lis
         print(f"[RUNNER] No missing data — skipping detail enrichment")
         return records
 
-    print(f"[RUNNER] Detail enrichment: {len(missing)} businesses need website/phone")
+    print(f"[RUNNER] Detail enrichment: {len(missing)} businesses")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(channel="chrome", headless=True, slow_mo=0)
@@ -477,17 +531,11 @@ async def _enrich_missing(records: list, pool: asyncpg.Pool, job_id: str) -> lis
                     try: await ctx.close()
                     except: pass
 
-        await asyncio.gather(
-            *[fetch_one(r) for r in missing],
-            return_exceptions=True,
-        )
+        await asyncio.gather(*[fetch_one(r) for r in missing], return_exceptions=True)
         await browser.close()
 
-    enriched_web   = sum(1 for r in records if str(r.get("Website","")).strip())
-    enriched_phone = sum(1 for r in records if str(r.get("Phone","")).strip())
-    print(f"[RUNNER] After enrichment: {enriched_web} with website, {enriched_phone} with phone")
-
-    # Update DB with new counts
+    enriched_web = sum(1 for r in records if str(r.get("Website","")).strip())
+    print(f"[RUNNER] After enrichment: {enriched_web} with website")
     await _update_job(pool, job_id, with_website=enriched_web)
     return records
 
@@ -641,7 +689,7 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
             if p_instance:
                 try: await p_instance.stop()
                 except: pass
-            # Always increment — even if browser crashed
+            # Always increment — even on crash
             done[0] += 1
             if done[0] % 10 == 0 or done[0] == total:
                 found = sum(1 for r in records if r.get("Email"))
@@ -667,54 +715,6 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
 
 
 # ═══════════════════════════════════════════════════════════════
-#  PREPROCESS
-# ═══════════════════════════════════════════════════════════════
-def _preprocess(folder_path: Path, state: str, industry: str):
-    import glob
-    all_files = glob.glob(str(folder_path / "*.csv"))
-    if not all_files:
-        return pd.DataFrame(), pd.DataFrame()
-
-    df_list = []
-    for f in all_files:
-        try:
-            df = pd.read_csv(f, encoding="latin1")
-            if "City" not in df.columns:
-                df["City"] = Path(f).stem.replace(f"_{state}", "").replace("_", " ")
-            df_list.append(df)
-        except Exception:
-            continue
-
-    if not df_list:
-        return pd.DataFrame(), pd.DataFrame()
-
-    merged = pd.concat(df_list, ignore_index=True)
-    cols = ["Name","Category","City","Rating","Reviews","Address","Phone","Email","Website","Maps_URL"]
-    merged = merged[[c for c in cols if c in merged.columns]]
-    merged = merged.loc[:, ~merged.columns.str.contains("^Unnamed")].dropna(how="all")
-    for col in merged.columns:
-        merged[col] = merged[col].fillna("").astype(str).str.strip()
-    if "Phone"   in merged.columns: merged["Phone"]   = merged["Phone"].apply(format_phone)
-    if "Address" in merged.columns: merged["Address"] = merged["Address"].apply(clean_address)
-
-    name_cities = merged.groupby("Name")["City"].apply(
-        lambda x: ", ".join(sorted(set(c.strip() for c in x if c.strip())))
-    ).to_dict()
-    name_count = merged.groupby("Name")["Name"].count().to_dict()
-    merged["Times_Found"]     = merged["Name"].map(lambda n: name_count.get(n, 1))
-    merged["Found_In_Cities"] = merged["Name"].map(lambda n: name_cities.get(n, ""))
-
-    has_phone = merged[merged["Phone"] != ""].copy()
-    no_phone  = merged[merged["Phone"] == ""].copy()
-    has_phone = has_phone.drop_duplicates(subset=["Name","Phone"], keep="first")
-    merged    = pd.concat([has_phone, no_phone], ignore_index=True).sort_values(["City","Name"]).reset_index(drop=True)
-
-    no_web   = merged[merged["Website"] == ""].copy()
-    with_web = merged[merged["Website"] != ""].copy()
-    return with_web, no_web
-
-
-# ═══════════════════════════════════════════════════════════════
 #  MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════════
 async def run_scrape_job(
@@ -737,7 +737,7 @@ async def run_scrape_job(
     with tempfile.TemporaryDirectory() as tmpdir:
         out_dir = Path(tmpdir)
 
-        # ── PHASE 1: Google Maps Scraping ──
+        # ── PHASE 1: Google Maps ──
         async with async_playwright() as p:
             browser = await p.chromium.launch(channel="chrome", headless=True, slow_mo=0)
             total_raw = 0
@@ -762,8 +762,7 @@ async def run_scrape_job(
                           no_website=no_website_cnt,
                           duplicates_removed=max(total_raw - total_clean, 0))
 
-        # ── PHASE 2: Detail Page Enrichment ──
-        # Only run if there are businesses missing website/phone
+        # ── PHASE 2: Detail Enrichment ──
         if not no_web_df.empty or (not with_web_df.empty and with_web_df["Phone"].eq("").any()):
             await _update_job(pool, job_id, current_step="step2_enrich")
             all_records = pd.concat([with_web_df, no_web_df], ignore_index=True).to_dict("records")
