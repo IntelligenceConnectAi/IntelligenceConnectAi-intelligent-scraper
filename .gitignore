@@ -1,0 +1,24 @@
+# ── Environments / secrets — never commit ──
+.env
+.env.local
+.env.*.local
+*.pem
+
+# ── Python ──
+Backend/venv/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ── Node ──
+node_modules/
+frontend/dist/
+
+# ── Logs ──
+*.log
+
+# ── Editors / OS ──
+.DS_Store
+.idea/
+.vscode/
