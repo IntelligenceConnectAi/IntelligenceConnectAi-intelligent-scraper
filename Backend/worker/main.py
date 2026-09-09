@@ -2,10 +2,12 @@
 Intelligent Scraper — Background Worker
 Polls the jobs table every 3 seconds for pending jobs.
 
-Global limit: MAX_GLOBAL_CONCURRENT = 2
-  - Max 2 jobs running at the same time across ALL users
-  - 3rd user waits in queue
-  - As soon as either of the 2 finish, next pending job starts automatically
+Global limit: MAX_GLOBAL_CONCURRENT = 10
+  - Max 10 jobs running at the same time across ALL users (raised from 2 —
+    sized for a single beefier instance, e.g. Railway Pro's 24 vCPU/24GB
+    replica tier; still one process, no horizontal-replica support)
+  - 11th user waits in queue
+  - As soon as any running job finishes, next pending job starts automatically
 
 Resilience (worker_heartbeats table, jobs.retry_count):
   - The poll loop writes a heartbeat every cycle; 3 consecutive DB failures trigger
@@ -52,18 +54,24 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Global concurrency limit ──────────────────────────────────
-MAX_GLOBAL_CONCURRENT = 2   # max jobs running at once across all users
+MAX_GLOBAL_CONCURRENT = 10   # max jobs running at once across all users — was 2;
+                              # raised for a single beefier instance (Tier-1 scale-up,
+                              # no multi-replica changes). Re-tune based on real RAM/CPU
+                              # per headless Chromium instance observed under load.
 
 # ── Resilience tuning ──────────────────────────────────────────
 WATCHDOG_INTERVAL_S = 45       # was 300 (5 min)
-STUCK_THRESHOLD_MIN = 10       # was 5 — Phase 3's EMAIL_CRAWL_TIMEOUT is 240s (4min)
-                                # at MAX_CONCURRENT_EMAIL=3, so one worst-case round
-                                # where all 3 slots simultaneously hit the full cap
-                                # with zero completions is itself 240s; two such
-                                # rounds back-to-back (480s) needs to stay comfortably
-                                # under this threshold, hence 10min not 5. Phase 2
-                                # detail enrichment's own worst-case gap is still only
-                                # ~2.8min; Phase 1 is separately time-bounded (runner.py)
+STUCK_THRESHOLD_MIN = 10       # was 5 — Phase 3's EMAIL_CRAWL_TIMEOUT is 240s (4min),
+                                # so one worst-case round where every concurrent slot
+                                # simultaneously hits the full cap with zero completions
+                                # is itself 240s; two such rounds back-to-back (480s)
+                                # needs to stay comfortably under this threshold, hence
+                                # 10min not 5. This bound does NOT depend on how many
+                                # concurrent slots there are (MAX_CONCURRENT_EMAIL) —
+                                # only on the per-item timeout — so raising that constant
+                                # doesn't require raising this one. Phase 2 detail
+                                # enrichment's own worst-case gap is still only ~2.8min;
+                                # Phase 1 is separately time-bounded (runner.py)
 MAX_AUTO_RETRIES = 2
 POOL_FAILURE_THRESHOLD = 3     # consecutive heartbeat failures before pool recreation
 HEARTBEAT_WORKER_ID = "primary"
@@ -99,7 +107,10 @@ class PoolHolder:
             new_pool = await asyncio.wait_for(
                 asyncpg.create_pool(
                     settings.database_url,
-                    min_size=2, max_size=5,
+                    # Sized for MAX_GLOBAL_CONCURRENT=10 jobs each writing progress
+                    # from several concurrent browser slots — was min=2/max=5, too
+                    # small once 10+ jobs can be live at once instead of 2.
+                    min_size=5, max_size=25,
                     command_timeout=60, statement_cache_size=0, timeout=10,
                 ),
                 timeout=15,
@@ -353,8 +364,12 @@ async def main() -> None:
 
     pool = await asyncpg.create_pool(
         settings.database_url,
-        min_size=2,
-        max_size=5,
+        # Sized for MAX_GLOBAL_CONCURRENT=10 jobs each writing progress from
+        # several concurrent browser slots — was min=2/max=5, too small once
+        # 10+ jobs can be live at once instead of 2. Must match PoolHolder.recreate()'s
+        # sizing above so a mid-run pool recreation doesn't quietly shrink capacity.
+        min_size=5,
+        max_size=25,
         command_timeout=60,
         statement_cache_size=0,
     )

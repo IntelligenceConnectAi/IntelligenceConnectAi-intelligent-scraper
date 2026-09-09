@@ -24,8 +24,14 @@ log = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════
-MAX_CONCURRENT_DETAIL = 3
-MAX_CONCURRENT_EMAIL  = 3
+# Concurrency caps — were 3/3 with no Phase-1 cap at all (fully sequential
+# city-by-city). Raised as part of a single-instance scale-up (Tier 1): more
+# concurrent headless Chromium contexts per job, sized for a beefier machine
+# (e.g. Railway Pro's 24 vCPU/24GB replica tier), not a hardware-driven ceiling
+# baked into the code — re-tune based on real RAM/CPU observed under load.
+MAX_CONCURRENT_DETAIL = 6
+MAX_CONCURRENT_EMAIL  = 6
+MAX_CONCURRENT_CITIES = 6   # Phase 1 (Maps) — new; previously had no concurrency at all
 PAGE_TIMEOUT_MS       = 15000
 FOOTER_WAIT_MS        = 3000
 # _crawl_site_for_email() tries up to 11 fallback paths per site (PRIORITY_PATHS
@@ -40,8 +46,11 @@ EMAIL_CRAWL_TIMEOUT   = 240.0
 MAPS_DETAIL_TIMEOUT   = 10.0
 # Phase 1 (Maps) has no other bound — _scroll_to_end only exits on a stabilized
 # card count or Google's "end of list" marker. Without this, a dense query on a
-# large metro could legitimately run past the worker's 5-minute stuck-job
-# threshold with zero DB writes and get incorrectly killed by the watchdog.
+# large metro could legitimately run past the worker's stuck-job threshold
+# (worker/main.py's STUCK_THRESHOLD_MIN) with zero DB writes and get
+# incorrectly killed by the watchdog. Applies per-city even under Phase 1's
+# concurrent scraping (MAX_CONCURRENT_CITIES) — each concurrent slot still
+# gets its own independent 180s cap.
 CITY_SCRAPE_TIMEOUT_S = 180
 
 PRIORITY_PATHS = [
@@ -920,22 +929,48 @@ async def run_scrape_job(
                 await _backfill_progress_from(merged)
             else:
                 # ── PHASE 1: Google Maps ──
+                # Concurrent across cities (MAX_CONCURRENT_CITIES), same
+                # semaphore+gather shape as Phase 2/Phase 3 — was a strict
+                # one-city-at-a-time for-loop, the biggest sequential bottleneck
+                # in the whole pipeline for large multi-city jobs. One shared
+                # browser, one fresh context per city (mirrors Phase 2's
+                # single-browser/multi-context design) — _scrape_city already
+                # closes its own context, so no extra cleanup needed here.
                 async with async_playwright() as p:
                     browser = await p.chromium.launch(channel="chrome", headless=True, slow_mo=0)
-                    total_raw = 0
-                    for i, city in enumerate(cities):
-                        await _update_job(pool, job_id, current_city=city, cities_done=i)
-                        try:
-                            rows = await asyncio.wait_for(
-                                _scrape_city(city, state, industry, browser, out_dir, pool, job_id),
-                                timeout=CITY_SCRAPE_TIMEOUT_S,
-                            )
-                        except asyncio.TimeoutError:
-                            log.error(f"[job {job_id[:8]}] {city} scrape timed out after {CITY_SCRAPE_TIMEOUT_S}s")
-                            await _update_city(pool, job_id, city, maps_status="failed", error="City scrape timed out")
-                            rows = []
-                        total_raw += len(rows)
-                        await _update_job(pool, job_id, cities_done=i + 1, total_raw=total_raw)
+                    city_sem = asyncio.Semaphore(MAX_CONCURRENT_CITIES)
+                    raw_total  = [0]
+                    done_total = [0]
+
+                    async def scrape_one_city(city):
+                        async with city_sem:
+                            await _update_job(pool, job_id, current_city=city)
+                            try:
+                                rows = await asyncio.wait_for(
+                                    _scrape_city(city, state, industry, browser, out_dir, pool, job_id),
+                                    timeout=CITY_SCRAPE_TIMEOUT_S,
+                                )
+                            except asyncio.CancelledError:
+                                raise
+                            except asyncio.TimeoutError:
+                                log.error(f"[job {job_id[:8]}] {city} scrape timed out after {CITY_SCRAPE_TIMEOUT_S}s")
+                                await _update_city(pool, job_id, city, maps_status="failed", error="City scrape timed out")
+                                rows = []
+                            except Exception as e:
+                                log.error(f"[job {job_id[:8]}] unexpected error scraping {city}: {e}")
+                                await _update_city(pool, job_id, city, maps_status="failed", error=str(e)[:200])
+                                rows = []
+                            # Update progress on every completion (not batched) —
+                            # same reasoning as Phase 2/3: with several cities
+                            # in flight at once, batching would let the watchdog
+                            # see a long gap with zero DB writes and misfire.
+                            raw_total[0]  += len(rows)
+                            done_total[0] += 1
+                            await _update_job(pool, job_id, cities_done=done_total[0], total_raw=raw_total[0])
+
+                    await asyncio.gather(*[scrape_one_city(city) for city in cities],
+                                        return_exceptions=True)
+                    total_raw = raw_total[0]
                     await browser.close()
 
                 await _update_job(pool, job_id, current_step="step2_preprocess", maps_done_at="NOW()")
