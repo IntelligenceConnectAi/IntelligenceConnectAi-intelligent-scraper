@@ -16,13 +16,13 @@ class UpdateProfileRequest(BaseModel):
 @router.get("/me", response_model=User)
 async def get_me(user: CurrentUserDep, db: DBConn) -> User:
     row = await db.fetchrow(
-        "SELECT id, email, full_name, is_admin, is_active, created_at FROM users WHERE id = $1",
+        "SELECT id, email, full_name, is_admin, is_active, platform_role, created_at FROM users WHERE id = $1",
         user.id,
     )
     if row is None:
         return User(
             id=user.id, email=user.email, full_name=None,
-            is_admin=False, is_active=True,
+            is_admin=False, is_active=True, platform_role=user.platform_role,
             created_at=datetime.now(timezone.utc),
         )
     return User(**dict(row))
@@ -34,7 +34,7 @@ async def update_profile(body: UpdateProfileRequest, user: CurrentUserDep, db: D
         """
         UPDATE users SET full_name = $2, updated_at = NOW()
         WHERE id = $1
-        RETURNING id, email, full_name, is_admin, is_active, created_at
+        RETURNING id, email, full_name, is_admin, is_active, platform_role, created_at
         """,
         user.id, body.full_name.strip(),
     )

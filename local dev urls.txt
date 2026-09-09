@@ -1,0 +1,5 @@
+
+Component	URL	Notes
+Frontend	http://localhost:5174	Open this in your browser
+Backend API	http://127.0.0.1:8001	Isolated local Supabase, not production
+Local Supabase Studio	http://127.0.0.1:54323	Browse/edit the local DB visually

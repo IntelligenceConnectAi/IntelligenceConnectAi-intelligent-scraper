@@ -4,11 +4,21 @@ import { supabase } from "../lib/supabase";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
 
+// Kept in sync with frontend/src/components/Settings.jsx's PLANS array —
+// there's no single shared source for this today (check-payment only
+// returns a plan_id, not a price), so this needs to stay hand-matched.
 const PLAN_LABELS = {
-  starter: { name: "Starter", price: "$29/mo", color: "#555" },
-  pro:     { name: "Pro",     price: "$79/mo", color: "#19DAB3" },
-  elite:   { name: "Elite",   price: "$199/mo", color: "#2176d9" },
+  starter: { name: "Starter", price: "$49/mo", color: "#555" },
+  pro:     { name: "Pro",     price: "$197/mo", color: "#19DAB3" },
+  elite:   { name: "Elite",   price: "$397/mo", color: "#2176d9" },
 };
+
+const SESSION_POLL_ATTEMPTS = 6;
+const SESSION_POLL_DELAY_MS = 5000;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 export default function Signup({ onSuccess }) {
   const [email, setEmail]         = useState("");
@@ -17,36 +27,60 @@ export default function Signup({ onSuccess }) {
   const [name, setName]           = useState("");
   const [loading, setLoading]     = useState(false);
   const [checking, setChecking]   = useState(false);
+  const [confirmingPayment, setConfirmingPayment] = useState(false);
   const [error, setError]         = useState("");
   const [planId, setPlanId]       = useState(null);
-  const [step, setStep]           = useState("email"); // email | details
+  const [step, setStep]           = useState("email"); // email | details | already-registered
   const [showPass, setShowPass]   = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
 
-  // Pre-fill email from URL param
+  // Pre-fill email/session_id from URL params (Stripe's redirect after checkout)
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const urlEmail = params.get("email");
-    if (urlEmail) {
-      setEmail(urlEmail);
-      checkPayment(urlEmail);
-    }
+    const sessionId = params.get("session_id");
+    if (urlEmail) setEmail(urlEmail);
+    if (urlEmail || sessionId) checkPayment(urlEmail, sessionId, { isRedirect: !!sessionId });
   }, []);
 
-  const checkPayment = async (emailToCheck) => {
-    if (!emailToCheck) return;
+  const checkPayment = async (emailToCheck, sessionId, { isRedirect = false } = {}) => {
+    if (!emailToCheck && !sessionId) return;
     setChecking(true); setError("");
     try {
-      const res = await fetch(
-        `${API_BASE}/auth/check-payment?email=${encodeURIComponent(emailToCheck)}`
-      );
+      const qs = new URLSearchParams();
+      if (emailToCheck) qs.set("email", emailToCheck);
+      if (sessionId) qs.set("session_id", sessionId);
+      const res = await fetch(`${API_BASE}/auth/check-payment?${qs.toString()}`);
       const data = await res.json();
+
+      if (data.email && !email) setEmail(data.email);
+
+      if (data.existing_account) {
+        setStep("already-registered");
+        return;
+      }
       if (data.paid) {
         setPlanId(data.plan_id);
         setStep("details");
-      } else {
-        setError("No payment found for this email. Please purchase a plan first.");
+        return;
       }
+
+      // Fresh Stripe redirect but not paid yet — the webhook may just be lagging
+      // behind the browser redirect. Poll briefly before giving up.
+      if (isRedirect && sessionId) {
+        setConfirmingPayment(true);
+        for (let attempt = 0; attempt < SESSION_POLL_ATTEMPTS; attempt++) {
+          await sleep(SESSION_POLL_DELAY_MS);
+          const retryRes = await fetch(`${API_BASE}/auth/check-payment?${qs.toString()}`);
+          const retryData = await retryRes.json();
+          if (retryData.email && !email) setEmail(retryData.email);
+          if (retryData.existing_account) { setStep("already-registered"); setConfirmingPayment(false); return; }
+          if (retryData.paid) { setPlanId(retryData.plan_id); setStep("details"); setConfirmingPayment(false); return; }
+        }
+        setConfirmingPayment(false);
+      }
+
+      setError("No payment found for this email. Please purchase a plan first.");
     } catch {
       setError("Network error. Please try again.");
     } finally {
@@ -87,6 +121,10 @@ export default function Signup({ onSuccess }) {
       const data = await res.json();
 
       if (!res.ok) {
+        if (res.status === 409) {
+          setStep("already-registered");
+          return;
+        }
         throw new Error(data.detail || "Registration failed");
       }
 
@@ -124,7 +162,33 @@ export default function Signup({ onSuccess }) {
           </span>
         </div>
 
-        {step === "email" ? (
+        {confirmingPayment ? (
+          <>
+            <h1 className="text-2xl font-bold mb-1" style={{ color: "var(--text)" }}>
+              Confirming your payment…
+            </h1>
+            <p className="text-sm mb-6" style={{ color: "var(--text-2)" }}>
+              This usually takes just a few seconds.
+            </p>
+            <div className="flex items-center justify-center py-6">
+              <span className="h-8 w-8 rounded-full border-2 border-[var(--accent)] border-t-transparent animate-spin" />
+            </div>
+          </>
+        ) : step === "already-registered" ? (
+          <>
+            <h1 className="text-2xl font-bold mb-1" style={{ color: "var(--text)" }}>
+              You already have an account
+            </h1>
+            <p className="text-sm mb-6" style={{ color: "var(--text-2)" }}>
+              {planId
+                ? "Your new plan is already active on your existing account — just log in to start using it."
+                : "Log in to your existing account to continue."}
+            </p>
+            <a href="/" className="btn-primary w-full block text-center">
+              Log in →
+            </a>
+          </>
+        ) : step === "email" ? (
           <>
             <h1 className="text-2xl font-bold mb-1" style={{ color: "var(--text)" }}>
               Complete your account
@@ -174,7 +238,7 @@ export default function Signup({ onSuccess }) {
             {/* Plan badge */}
             {plan && (
               <div className="flex items-center gap-2 mb-5 p-3 rounded-lg"
-                style={{ background: "var(--accent-dim)", border: "1px solid rgba(25,218,179,0.2)" }}>
+                style={{ background: "var(--accent-dim)", border: "1px solid var(--accent-glow)" }}>
                 <div className="h-6 w-6 rounded-md flex items-center justify-center text-xs font-bold"
                   style={{ background: "var(--accent)", color: "#fff" }}>✓</div>
                 <div>

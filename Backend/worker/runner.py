@@ -5,6 +5,8 @@ Uses full Chrome (channel="chrome").
 """
 
 import asyncio
+import json
+import logging
 from datetime import datetime, timezone
 import csv
 import io
@@ -17,6 +19,8 @@ import asyncpg
 import pandas as pd
 from playwright.async_api import async_playwright
 
+log = logging.getLogger(__name__)
+
 # ═══════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════
@@ -24,8 +28,21 @@ MAX_CONCURRENT_DETAIL = 3
 MAX_CONCURRENT_EMAIL  = 3
 PAGE_TIMEOUT_MS       = 15000
 FOOTER_WAIT_MS        = 3000
-EMAIL_CRAWL_TIMEOUT   = 30.0
+# _crawl_site_for_email() tries up to 11 fallback paths per site (PRIORITY_PATHS
+# below), stopping early only once it finds an email at the site's own domain.
+# Worst case — no early match, every one of the 11 pages needs its full
+# PAGE_TIMEOUT_MS (15s) — that's 11*15s ~= 165s of page loads alone, plus
+# ~10-15s of per-page wait/sleep overhead: ~178s total. 240s leaves a real ~60s
+# margin over that worst case, deliberately — don't shrink this without
+# re-doing the math, a shorter cap cuts off legitimate slow-loading sites
+# before they ever reach page 3+ where the email often actually is.
+EMAIL_CRAWL_TIMEOUT   = 240.0
 MAPS_DETAIL_TIMEOUT   = 10.0
+# Phase 1 (Maps) has no other bound — _scroll_to_end only exits on a stabilized
+# card count or Google's "end of list" marker. Without this, a dense query on a
+# large metro could legitimately run past the worker's 5-minute stuck-job
+# threshold with zero DB writes and get incorrectly killed by the watchdog.
+CITY_SCRAPE_TIMEOUT_S = 180
 
 PRIORITY_PATHS = [
     "",
@@ -385,21 +402,24 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
             btn = page.locator('button:has-text("Accept all")').first
             if await btn.is_visible(timeout=2000):
                 await btn.click(); await asyncio.sleep(1)
-        except: pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
         try:
             await page.wait_for_selector('div[role="feed"]', timeout=20000)
             await asyncio.sleep(2)  # wait for feed to fully render
         except Exception:
             title = await page.title()
-            print(f"[RUNNER] Feed not found for {city}. Title: {title}")
+            log.warning(f"[job {job_id[:8]}] feed not found for {city}, title={title}")
             await context.close()
             await _update_city(pool, job_id, city, maps_status="done", maps_leads=0)
             return []
 
         title     = await page.title()
         card_count = await page.locator('div[role="feed"] > div > div[jsaction]').count()
-        print(f"[RUNNER] {city}: title={title}, cards_before_scroll={card_count}")
+        log.info(f"[job {job_id[:8]}] {city}: title={title}, cards_before_scroll={card_count}")
 
         await _scroll_to_end(page)
 
@@ -421,7 +441,7 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
                 "Maps_URL": r.get("maps_url", ""),
             })
 
-        print(f"[RUNNER] {city}: found {len(results)} results")
+        log.info(f"[job {job_id[:8]}] {city}: found {len(results)} results")
 
         if results:
             fields = ["Name","Category","Rating","Reviews","Address","Phone","Email","Website","Maps_URL"]
@@ -430,7 +450,7 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
                 w.writeheader(); w.writerows(results)
 
     except Exception as e:
-        print(f"[RUNNER] Error scraping {city}: {e}")
+        log.error(f"[job {job_id[:8]}] error scraping {city}: {e}")
         await _update_city(pool, job_id, city, maps_status="failed", error=str(e)[:200])
         return []
     finally:
@@ -498,10 +518,12 @@ async def _enrich_missing(records: list, pool: asyncpg.Pool, job_id: str) -> lis
                and str(r.get("Maps_URL","")).strip()]
 
     if not missing:
-        print(f"[RUNNER] No missing data — skipping detail enrichment")
+        log.info(f"[job {job_id[:8]}] no missing data - skipping detail enrichment")
         return records
 
-    print(f"[RUNNER] Detail enrichment: {len(missing)} businesses")
+    log.info(f"[job {job_id[:8]}] detail enrichment: {len(missing)} businesses")
+    total = len(missing)
+    done  = [0]
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(channel="chrome", headless=True, slow_mo=0)
@@ -530,12 +552,23 @@ async def _enrich_missing(records: list, pool: asyncpg.Pool, job_id: str) -> lis
                     except: pass
                     try: await ctx.close()
                     except: pass
+                    # Checkpoint updated_at periodically — without this, a batch large
+                    # enough to take >5min at MAX_CONCURRENT_DETAIL looks "stuck" to the
+                    # watchdog (worker/main.py) and gets killed + retried even though it's
+                    # still legitimately working. Mirrors the Phase 3 email-crawl pattern.
+                    done[0] += 1
+                    if done[0] % 10 == 0 or done[0] == total:
+                        enriched_so_far = sum(1 for r in records if str(r.get("Website","")).strip())
+                        try:
+                            await _update_job(pool, job_id, with_website=enriched_so_far)
+                        except Exception as e:
+                            log.error(f"[job {job_id[:8]}] DB update error: {e}")
 
         await asyncio.gather(*[fetch_one(r) for r in missing], return_exceptions=True)
         await browser.close()
 
     enriched_web = sum(1 for r in records if str(r.get("Website","")).strip())
-    print(f"[RUNNER] After enrichment: {enriched_web} with website")
+    log.info(f"[job {job_id[:8]}] after enrichment: {enriched_web} with website")
     await _update_job(pool, job_id, with_website=enriched_web)
     return records
 
@@ -553,7 +586,9 @@ async def _extract_emails_from_page(page, is_homepage=False):
                     timeout=FOOTER_WAIT_MS, state="attached"
                 )
                 await asyncio.sleep(1.2)
-            except:
+            except asyncio.CancelledError:
+                raise
+            except Exception:
                 await asyncio.sleep(0.8)
         else:
             await asyncio.sleep(0.8)
@@ -574,7 +609,10 @@ async def _extract_emails_from_page(page, is_homepage=False):
             """)
             for e in EMAIL_REGEX.findall(header_text or ""):
                 if is_valid_email(e): found.add(clean_email(e))
-        except: pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
         try:
             footer_text = await page.evaluate("""
@@ -585,7 +623,10 @@ async def _extract_emails_from_page(page, is_homepage=False):
             """)
             for e in EMAIL_REGEX.findall(footer_text or ""):
                 if is_valid_email(e): found.add(clean_email(e))
-        except: pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
         body_text = await page.inner_text("body")
         clean_html = re.sub(r"<(script|style|noscript)[^>]*>[\s\S]*?</\1>", "", await page.content(), flags=re.IGNORECASE)
@@ -596,7 +637,10 @@ async def _extract_emails_from_page(page, is_homepage=False):
         for e in EMAIL_REGEX.findall(decoded):
             if is_valid_email(e): found.add(clean_email(e))
 
-    except: pass
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
     return found
 
 
@@ -628,11 +672,14 @@ async def _crawl_site_for_email(ctx, start_url):
             })
             await page.goto(url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
             return await _extract_emails_from_page(page, is_homepage=is_hp)
-        except:
+        except asyncio.CancelledError:
+            raise
+        except Exception:
             return set()
         finally:
             try: await page.close()
-            except: pass
+            except Exception:
+                pass
 
     for i, path in enumerate(PRIORITY_PATHS):
         url = urljoin(base_url + "/", path.lstrip("/")) if path else start_url
@@ -674,13 +721,13 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                 )
                 browsers.append(b)
             except Exception as e:
-                print(f"[RUNNER] Browser launch failed: {e}")
+                log.error(f"[job {job_id[:8]}] browser launch failed: {e}")
 
         if not browsers:
-            print("[RUNNER] No browsers available for email scraping")
+            log.error(f"[job {job_id[:8]}] no browsers available for email scraping")
             return pd.DataFrame(records)
 
-        print(f"[RUNNER] Email browser pool: {len(browsers)} browsers ready")
+        log.info(f"[job {job_id[:8]}] email browser pool: {len(browsers)} browsers ready")
 
         # Round-robin browser assignment
         browser_idx = [0]
@@ -720,7 +767,7 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
                             )
                         except Exception as e:
-                            print(f"[RUNNER] Browser recovery failed: {e}")
+                            log.error(f"[job {job_id[:8]}] browser recovery failed: {e}")
                             done[0] += 1
                             return
 
@@ -729,29 +776,38 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                         timeout=EMAIL_CRAWL_TIMEOUT,
                     )
             except asyncio.TimeoutError:
-                print(f"[RUNNER] Email timeout: {row.get('Website')}")
+                log.warning(f"[job {job_id[:8]}] email timeout: {row.get('Website')}")
             except Exception as e:
-                print(f"[RUNNER] Email error: {type(e).__name__}")
+                log.warning(f"[job {job_id[:8]}] email error: {type(e).__name__}")
             finally:
                 if ctx:
                     try: await ctx.close()
-                    except: pass
+                    except asyncio.CancelledError: raise
+                    except Exception: pass
                 done[0] += 1
+                # Checkpoint every completion, not every 10 — a batch of 10 at only
+                # MAX_CONCURRENT_EMAIL=3 concurrent slots, each individually allowed up
+                # to EMAIL_CRAWL_TIMEOUT=30s, has no real headroom against the watchdog's
+                # 5-minute stuck threshold: a real run hit a 5m13s gap between two
+                # every-10 checkpoints (mostly successful-but-slow page loads, not even
+                # all timeouts) and got wrongly killed as "stalled" while still actively
+                # working. Checkpointing every item removes that risk at negligible cost
+                # (one cheap UPDATE per ~10-30s per worker slot).
+                found = sum(1 for r in records if r.get("Email"))
                 if done[0] % 10 == 0 or done[0] == total:
-                    found = sum(1 for r in records if r.get("Email"))
-                    print(f"[RUNNER] Email progress: {done[0]}/{total} | found: {found}")
-                    try:
-                        await _update_job(pool, job_id,
-                                          emails_attempted=done[0],
-                                          emails_found=found)
-                    except Exception as e:
-                        print(f"[RUNNER] DB update error: {e}")
+                    log.info(f"[job {job_id[:8]}] email progress: {done[0]}/{total} | found: {found}")
+                try:
+                    await _update_job(pool, job_id,
+                                      emails_attempted=done[0],
+                                      emails_found=found)
+                except Exception as e:
+                    log.error(f"[job {job_id[:8]}] DB update error: {e}")
 
         async def safe_process(r):
             try:
                 await process_one(r)
             except Exception as e:
-                print(f"[RUNNER] Task error: {e}")
+                log.error(f"[job {job_id[:8]}] task error: {e}")
 
         await asyncio.gather(
             *[safe_process(r) for r in records if str(r.get("Website","")).strip()],
@@ -779,52 +835,143 @@ async def run_scrape_job(
     include_emails: bool,
     pool: asyncpg.Pool,
     upload_fn,
+    download_fn,
+    delete_fn,
 ) -> dict:
+    # ── Resumable checkpoints ──
+    # Phase 1 (Maps) and Phase 2 (enrichment) can each take 20-60+ minutes. Previously,
+    # any retry — auto (watchdog) or manual — threw all of that away and restarted at
+    # Phase 1, even if the job had actually gotten as far as Phase 3 (email crawl)
+    # before being killed. We now durably save the lead records found so far right
+    # after each phase finishes; on (re)entry here we check for the most advanced
+    # checkpoint that exists and skip straight past whatever it already covers.
+    checkpoint_maps_path   = f"{user_id}/{job_id}/_checkpoint_maps.json"
+    checkpoint_enrich_path = f"{user_id}/{job_id}/_checkpoint_enrich.json"
+
+    def _split_by_website(df: pd.DataFrame):
+        if df.empty:
+            return df.copy(), df.copy()
+        with_web = df[df["Website"].astype(str).str.strip() != ""].copy()
+        no_web   = df[df["Website"].astype(str).str.strip() == ""].copy()
+        return with_web, no_web
+
+    async def _load_checkpoint(path: str):
+        try:
+            raw = await download_fn(path)
+        except Exception as e:
+            log.warning(f"[job {job_id[:8]}] checkpoint read failed for {path}, ignoring: {e}")
+            return None
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw)
+            return data["total_raw"], pd.DataFrame(data["records"])
+        except Exception as e:
+            log.error(f"[job {job_id[:8]}] checkpoint at {path} unreadable, ignoring: {e}")
+            return None
+
+    async def _save_checkpoint(path: str, total_raw_val: int, df: pd.DataFrame):
+        # default=str covers non-JSON-native dtypes (e.g. Times_Found is a numpy int)
+        payload = json.dumps({"total_raw": total_raw_val, "records": df.to_dict("records")},
+                             default=str).encode("utf-8")
+        try:
+            await upload_fn(payload, path)
+        except Exception as e:
+            log.error(f"[job {job_id[:8]}] failed to save checkpoint at {path}: {e}")
+
+    async def _backfill_progress_from(df: pd.DataFrame):
+        """Resume shortcut: mark every city + the job's Phase-1 counters as already
+        done, computed from a loaded checkpoint, so the UI reflects reality
+        immediately instead of sitting at 0/N while a later phase runs."""
+        per_city = df.groupby("City").size().to_dict() if ("City" in df.columns and not df.empty) else {}
+        for city in cities:
+            await _update_city(pool, job_id, city, maps_status="done",
+                               maps_leads=per_city.get(city, 0), maps_done_at="NOW()")
+        await _update_job(pool, job_id, cities_done=len(cities), maps_done_at="NOW()")
+
+    resumed_enrich = await _load_checkpoint(checkpoint_enrich_path)
+    resumed_maps   = None if resumed_enrich else await _load_checkpoint(checkpoint_maps_path)
+
+    start_step = "step3_emails" if resumed_enrich else ("step2_enrich" if resumed_maps else "step1_maps")
     await _update_job(pool, job_id,
-                      status="running",
-                      started_at="NOW()",
-                      current_step="step1_maps",
-                      cities_total=len(cities))
+                      status="running", started_at="NOW()",
+                      current_step=start_step, cities_total=len(cities))
 
     with tempfile.TemporaryDirectory() as tmpdir:
         out_dir = Path(tmpdir)
 
-        # ── PHASE 1: Google Maps ──
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(channel="chrome", headless=True, slow_mo=0)
-            total_raw = 0
-            for i, city in enumerate(cities):
-                await _update_job(pool, job_id, current_city=city, cities_done=i)
-                rows = await _scrape_city(city, state, industry, browser, out_dir, pool, job_id)
-                total_raw += len(rows)
-                await _update_job(pool, job_id, cities_done=i + 1, total_raw=total_raw)
-            await browser.close()
-
-        await _update_job(pool, job_id, current_step="step2_preprocess", maps_done_at="NOW()")
-
-        # ── PREPROCESS ──
-        with_web_df, no_web_df = _preprocess(out_dir, state, industry)
-        total_clean      = len(with_web_df) + len(no_web_df)
-        with_website_cnt = len(with_web_df)
-        no_website_cnt   = len(no_web_df)
-
-        await _update_job(pool, job_id,
-                          total_clean=total_clean,
-                          with_website=with_website_cnt,
-                          no_website=no_website_cnt,
-                          duplicates_removed=max(total_raw - total_clean, 0))
-
-        # ── PHASE 2: Detail Enrichment ──
-        if not no_web_df.empty or (not with_web_df.empty and with_web_df["Phone"].eq("").any()):
-            await _update_job(pool, job_id, current_step="step2_enrich")
-            all_records = pd.concat([with_web_df, no_web_df], ignore_index=True).to_dict("records")
-            all_records = await _enrich_missing(all_records, pool, job_id)
-            all_df      = pd.DataFrame(all_records)
-            with_web_df = all_df[all_df["Website"].astype(str).str.strip() != ""].copy()
-            no_web_df   = all_df[all_df["Website"].astype(str).str.strip() == ""].copy()
+        if resumed_enrich:
+            total_raw, all_df = resumed_enrich
+            with_web_df, no_web_df = _split_by_website(all_df)
+            total_clean = len(with_web_df) + len(no_web_df)
+            log.info(f"[job {job_id[:8]}] resuming from enrichment checkpoint — "
+                    f"skipping Maps + enrichment ({total_clean} leads already found)")
+            await _backfill_progress_from(all_df)
             await _update_job(pool, job_id,
-                              with_website=len(with_web_df),
-                              no_website=len(no_web_df))
+                              total_raw=total_raw, total_clean=total_clean,
+                              with_website=len(with_web_df), no_website=len(no_web_df),
+                              duplicates_removed=max(total_raw - total_clean, 0))
+
+        else:
+            if resumed_maps:
+                total_raw, merged = resumed_maps
+                log.info(f"[job {job_id[:8]}] resuming from Maps checkpoint — "
+                        f"skipping Maps scrape ({len(merged)} leads already found)")
+                await _backfill_progress_from(merged)
+            else:
+                # ── PHASE 1: Google Maps ──
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(channel="chrome", headless=True, slow_mo=0)
+                    total_raw = 0
+                    for i, city in enumerate(cities):
+                        await _update_job(pool, job_id, current_city=city, cities_done=i)
+                        try:
+                            rows = await asyncio.wait_for(
+                                _scrape_city(city, state, industry, browser, out_dir, pool, job_id),
+                                timeout=CITY_SCRAPE_TIMEOUT_S,
+                            )
+                        except asyncio.TimeoutError:
+                            log.error(f"[job {job_id[:8]}] {city} scrape timed out after {CITY_SCRAPE_TIMEOUT_S}s")
+                            await _update_city(pool, job_id, city, maps_status="failed", error="City scrape timed out")
+                            rows = []
+                        total_raw += len(rows)
+                        await _update_job(pool, job_id, cities_done=i + 1, total_raw=total_raw)
+                    await browser.close()
+
+                await _update_job(pool, job_id, current_step="step2_preprocess", maps_done_at="NOW()")
+
+                # ── PREPROCESS ──
+                with_web_df, no_web_df = _preprocess(out_dir, state, industry)
+                merged = pd.concat([with_web_df, no_web_df], ignore_index=True)
+
+                # Checkpoint: Maps scrape + merge/dedupe is durably saved — a retry
+                # from here on will skip straight back to this point instead of
+                # re-scraping every city from zero.
+                await _save_checkpoint(checkpoint_maps_path, total_raw, merged)
+
+            with_web_df, no_web_df = _split_by_website(merged)
+            total_clean = len(merged)
+            await _update_job(pool, job_id,
+                              current_step="step2_preprocess",
+                              total_raw=total_raw, total_clean=total_clean,
+                              with_website=len(with_web_df), no_website=len(no_web_df),
+                              duplicates_removed=max(total_raw - total_clean, 0))
+
+            # ── PHASE 2: Detail Enrichment ──
+            if not no_web_df.empty or (not with_web_df.empty and with_web_df["Phone"].eq("").any()):
+                await _update_job(pool, job_id, current_step="step2_enrich")
+                all_records = pd.concat([with_web_df, no_web_df], ignore_index=True).to_dict("records")
+                all_records = await _enrich_missing(all_records, pool, job_id)
+                all_df      = pd.DataFrame(all_records)
+                with_web_df, no_web_df = _split_by_website(all_df)
+                await _update_job(pool, job_id,
+                                  with_website=len(with_web_df),
+                                  no_website=len(no_web_df))
+
+            # Checkpoint: enrichment is done (or wasn't needed) — a retry from here
+            # on will skip Maps AND enrichment and go straight to email scraping.
+            await _save_checkpoint(checkpoint_enrich_path, total_raw,
+                                   pd.concat([with_web_df, no_web_df], ignore_index=True))
 
         # ── PHASE 3: Email Scraping ──
         if include_emails and not with_web_df.empty:
@@ -853,6 +1000,15 @@ async def run_scrape_job(
                           with_web_csv=with_web_path,
                           no_web_csv=no_web_path,
                           completed_at="NOW()")
+
+        # Checkpoints are only useful mid-flight — clean up now that the job
+        # succeeded (best-effort; a leftover file here is harmless clutter, not a
+        # correctness problem, since no future job ever reuses this job_id's path).
+        for cp_path in (checkpoint_maps_path, checkpoint_enrich_path):
+            try:
+                await delete_fn(cp_path)
+            except Exception as e:
+                log.warning(f"[job {job_id[:8]}] checkpoint cleanup failed for {cp_path}: {e}")
 
         return {
             "total_raw":    total_raw,

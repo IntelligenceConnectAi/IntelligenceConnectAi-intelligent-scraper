@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     database_url: str
     cors_origins: str = "http://localhost:5173"
     debug: bool = False
+    frontend_base_url: str = "http://localhost:5173"
 
     # Stripe
     stripe_secret_key: str = ""
@@ -22,6 +23,19 @@ class Settings(BaseSettings):
     stripe_starter_price_id: str = ""
     stripe_pro_price_id: str = ""
     stripe_elite_price_id: str = ""
+
+    # Email (Resend)
+    resend_api_key: str = ""
+    email_from_address: str = ""
+    email_mode: str = "log"  # "log" (default, safe for local dev) | "send"
+
+    @property
+    def stripe_price_to_plan(self) -> dict[str, str]:
+        return {
+            self.stripe_starter_price_id: "starter",
+            self.stripe_pro_price_id: "pro",
+            self.stripe_elite_price_id: "elite",
+        }
 
     @property
     def cors_origins_list(self) -> list[str]:

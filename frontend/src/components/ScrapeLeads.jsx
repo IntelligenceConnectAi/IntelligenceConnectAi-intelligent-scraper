@@ -1,63 +1,19 @@
 import { useEffect, useRef, useState } from "react";
+import { normalizeStateInput } from "../lib/usStates";
 import { api } from "../lib/api";
+import SecureProcessingGlobe from "./SecureProcessingGlobe";
+import StatusIndicator from "./StatusIndicator";
 
-function StatusBadge({ status }) {
-  const config = {
-    pending:        { cls: "badge-muted",                      label: "Queued"         },
-    running:        { cls: "badge-blue animate-soft-pulse",    label: "Running"        },
-    preprocessing:  { cls: "badge-purple animate-soft-pulse",  label: "Processing"     },
-    email_scraping: { cls: "badge-blue animate-soft-pulse",    label: "Finding emails" },
-    done:           { cls: "badge-accent",                     label: "Done"           },
-    failed:         { cls: "badge-danger",                     label: "Failed"         },
-    canceled:       { cls: "badge-muted",                      label: "Canceled"       },
-  };
-  const c = config[status] || config.pending;
-  return <span className={`badge ${c.cls}`}>{c.label}</span>;
-}
-
-function StepBar({ step }) {
-  const steps = [
-    { key: "step1_maps",       label: "Maps"    },
-    { key: "step2_preprocess", label: "Process" },
-    { key: "step3_emails",     label: "Emails"  },
-    { key: "complete",         label: "Done"    },
-  ];
-  const cur = steps.findIndex(s => s.key === step);
-  return (
-    <div className="flex items-center gap-1 flex-wrap">
-      {steps.map((s, i) => (
-        <div key={s.key} className="flex items-center gap-1">
-          <span className={`badge text-[10px] ${
-            i < cur   ? "badge-accent" :
-            i === cur ? "badge-accent animate-soft-pulse" :
-                        "badge-muted"
-          }`}>{s.label}</span>
-          {i < steps.length - 1 && (
-            <span className="text-xs" style={{ color: "var(--text-3)" }}>›</span>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function JobProgress({ jobId, onNewJob }) {
+export function JobProgress({ jobId, onNewJob }) {
   const [job, setJob]     = useState(null);
   const [error, setError] = useState("");
   const timer             = useRef(null);
 
-  // ── FIX 1: Persist job data in localStorage so tab switch doesn't lose state ──
-  useEffect(() => {
-    if (jobId) {
-      localStorage.setItem("active_job_id", jobId);
-    }
-  }, [jobId]);
-
   const fetchJob = async () => {
     try {
-      const d = await api.getJob(jobId);
+      const d = await api.getBusinessRequest(jobId);
       setJob(d);
-      if (["done", "failed", "canceled"].includes(d.status)) {
+      if (["Completed", "Cancelled", "Failed"].includes(d.status)) {
         clearInterval(timer.current);
       }
     } catch (e) {
@@ -82,40 +38,18 @@ function JobProgress({ jobId, onNewJob }) {
     catch (e) { setError(e.message); }
   };
 
-  const handleNewJob = () => {
-    localStorage.removeItem("active_job_id");
-    onNewJob();
-  };
-
   if (error) return (
-    <div className="p-3 rounded-lg text-sm" style={{
-      background: "rgba(255,77,106,0.08)",
-      border: "1px solid rgba(255,77,106,0.2)",
-      color: "var(--danger)"
-    }}>{error}</div>
+    <div className="alert-danger">{error}</div>
   );
 
   if (!job) return (
     <div className="text-sm animate-soft-pulse" style={{ color: "var(--text-3)" }}>Loading job…</div>
   );
 
-  const isComplete = job.status === "done";
-  const isFailed   = job.status === "failed";
-  const isCanceled = job.status === "canceled";
-  const isRunning  = !isComplete && !isFailed && !isCanceled;
-
-  const pct = job.cities_total > 0
-    ? Math.round((job.cities_done / job.cities_total) * 100)
-    : 0;
-
-  const emailsTotal     = job.with_website    ?? 0;
-  const emailsAttempted = job.emails_attempted ?? 0;
-  const emailsFound     = job.emails_found    ?? 0;
-  const emailsPct       = emailsTotal > 0
-    ? Math.round((emailsAttempted / emailsTotal) * 100)
-    : 0;
-  const emailsRunning = isRunning && job.current_step === "step3_emails";
-  const displayStatus = emailsRunning ? "email_scraping" : job.status;
+  const isComplete   = job.status === "Completed";
+  const isFailed     = job.status === "Failed";
+  const isCancelled  = job.status === "Cancelled";
+  const isProcessing = job.status === "Submitted" || job.status === "Processing";
 
   return (
     <div className="space-y-5 animate-fade-in">
@@ -130,50 +64,20 @@ function JobProgress({ jobId, onNewJob }) {
             {job.cities?.join(", ")}
           </p>
         </div>
-        <StatusBadge status={displayStatus} />
+        <StatusIndicator status={job.status} variant="business" />
       </div>
 
-      {/* Step bar */}
-      {isRunning && <StepBar step={job.current_step} />}
+      {/* Secure processing experience — no scraping internals shown */}
+      {isProcessing && <SecureProcessingGlobe variant="business" />}
 
-      {/* Maps progress */}
-      {job.cities_total > 0 && (
-        <div>
-          <div className="flex justify-between text-xs mb-2" style={{ color: "var(--text-2)" }}>
-            <span>
-              {job.current_step === "step1_maps" && job.current_city
-                ? `Scraping: ${job.current_city}`
-                : `${job.cities_done} / ${job.cities_total} cities`}
-            </span>
-            <span className="mono">{pct}%</span>
-          </div>
-          <div className="progress-bar">
-            <div className="progress-fill" style={{ width: `${pct}%` }} />
-          </div>
-        </div>
-      )}
-
-      {/* Email progress */}
-      {(emailsRunning || (isComplete && emailsTotal > 0)) && (
-        <div>
-          <div className="flex justify-between text-xs mb-2" style={{ color: "var(--text-2)" }}>
-            <span>Finding emails…</span>
-            <span className="mono">{emailsAttempted} / {emailsTotal} sites · {emailsFound} found</span>
-          </div>
-          <div className="progress-bar">
-            <div className="progress-fill" style={{ width: `${emailsPct}%` }} />
-          </div>
-        </div>
-      )}
-
-      {/* ── FIX 2: KPIs only show when job is DONE ── */}
+      {/* KPIs only show when the request is complete */}
       {isComplete && (
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           {[
-            { label: "Total leads",  value: job.total_clean  ?? 0 },
-            { label: "With website", value: emailsTotal },
+            { label: "Total leads",  value: job.total_leads  ?? 0 },
+            { label: "With website", value: job.with_website ?? 0 },
             { label: "No website",   value: job.no_website   ?? 0 },
-            { label: "Emails found", value: emailsFound },
+            { label: "Emails found", value: job.emails_found ?? 0 },
           ].map(s => (
             <div key={s.label} className="card p-3 text-center">
               <p className="stat-number text-2xl">{s.value}</p>
@@ -183,50 +87,14 @@ function JobProgress({ jobId, onNewJob }) {
         </div>
       )}
 
-      {/* City table */}
-      {job.city_progress?.length > 0 && (
-        <div className="card overflow-hidden">
-          <table className="w-full text-sm">
-            <thead style={{ borderBottom: "1px solid var(--border)" }}>
-              <tr>
-                <th className="px-4 py-2.5 text-left text-xs font-medium tracking-wider uppercase"
-                  style={{ color: "var(--text-3)" }}>City</th>
-                <th className="px-4 py-2.5 text-right label" style={{ marginBottom: 0 }}>Raw Leads</th>
-                <th className="px-4 py-2.5 text-left text-xs font-medium tracking-wider uppercase"
-                  style={{ color: "var(--text-3)" }}>Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {job.city_progress.map((c, i) => (
-                <tr key={c.city} style={{ borderTop: i > 0 ? "1px solid var(--border)" : "none" }}>
-                  <td className="px-4 py-2.5 font-medium" style={{ color: "var(--text)" }}>{c.city}</td>
-                  <td className="px-4 py-2.5 text-right mono text-xs" style={{ color: "var(--text-2)" }}>
-                    {c.maps_leads ?? 0}
-                  </td>
-                  <td className="px-4 py-2.5">
-                    <span className={`badge ${
-                      c.maps_status === "done"    ? "badge-accent" :
-                      c.maps_status === "running" ? "badge-blue animate-soft-pulse" :
-                      c.maps_status === "failed"  ? "badge-danger" : "badge-muted"
-                    }`}>
-                      {c.maps_status === "done"    ? "Done"    :
-                       c.maps_status === "running" ? "Running" :
-                       c.maps_status === "failed"  ? "Failed"  : "Queued"}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {job.error_message && (
-        <div className="p-3 rounded-lg text-sm" style={{
-          background: "rgba(255,77,106,0.08)",
-          border: "1px solid rgba(255,77,106,0.2)",
-          color: "var(--danger)"
-        }}>{job.error_message}</div>
+      {(isFailed || isCancelled) && (
+        isFailed ? (
+          <div className="alert-danger">{job.message}</div>
+        ) : (
+          <div className="p-3 rounded-lg text-sm" style={{
+            background: "var(--surface-soft)", border: "1px solid var(--border)", color: "var(--text-2)"
+          }}>{job.message}</div>
+        )
       )}
 
       {/* Action buttons */}
@@ -241,11 +109,11 @@ function JobProgress({ jobId, onNewJob }) {
             </button>
           </>
         )}
-        {isRunning && (
+        {isProcessing && (
           <button onClick={cancel} className="btn-danger">Cancel job</button>
         )}
-        {(isComplete || isFailed || isCanceled) && (
-          <button onClick={handleNewJob} className="btn-ghost">
+        {(isComplete || isFailed || isCancelled) && (
+          <button onClick={onNewJob} className="btn-ghost">
             ← New Job
           </button>
         )}
@@ -261,10 +129,7 @@ export default function ScrapeLeads({ plan }) {
   const [cities, setCities]           = useState([]);
   const [loading, setLoading]         = useState(false);
   const [error, setError]             = useState("");
-  const [activeJobId, setActiveJobId] = useState(() => {
-    // ── FIX 1: Restore active job from localStorage on mount ──
-    return localStorage.getItem("active_job_id") || null;
-  });
+  const [activeJobId, setActiveJobId] = useState(null);
 
   const maxCities = plan?.cities_per_job ?? 10;
 
@@ -313,14 +178,14 @@ export default function ScrapeLeads({ plan }) {
       : cities;
 
     if (!industry.trim())       { setError("Industry is required"); return; }
-    if (!state.trim())          { setError("State abbreviation is required"); return; }
+    if (!state.trim())          { setError("State is required"); return; }
     if (allCities.length === 0) { setError("Add at least one city"); return; }
 
     setLoading(true); setError("");
     try {
       const job = await api.createJob({
         industry: industry.trim(),
-        state: state.trim(),
+        state: normalizeStateInput(state),
         cities: allCities,
       });
       setActiveJobId(job.id);
@@ -344,8 +209,8 @@ export default function ScrapeLeads({ plan }) {
               <div>
                 <label className="label">State</label>
                 <input value={state}
-                  onChange={e => setState(e.target.value.toUpperCase().slice(0, 2))}
-                  placeholder="FL" maxLength={2} className="input mono" />
+                  onChange={e => setState(e.target.value)}
+                  placeholder="FL or Florida" maxLength={24} className="input mono" />
               </div>
             </div>
 

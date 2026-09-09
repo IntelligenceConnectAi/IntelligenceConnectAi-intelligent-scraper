@@ -1,19 +1,8 @@
-import { useEffect, useState } from "react";
+// Extracted from History.jsx (Phase 3) so Business Leads' "Completed Requests" tab
+// can reuse the exact same table/mobile-card rendering and download behavior.
+import { useState } from "react";
 import { api } from "../lib/api";
-
-function StatusBadge({ status }) {
-  const config = {
-    pending:       { cls: "badge-muted",   label: "Queued" },
-    running:       { cls: "badge-blue",    label: "Running" },
-    preprocessing: { cls: "badge-purple",  label: "Processing" },
-    email_scraping:{ cls: "badge-accent",  label: "Emails" },
-    done:          { cls: "badge-accent",  label: "Done" },
-    failed:        { cls: "badge-danger",  label: "Failed" },
-    canceled:      { cls: "badge-muted",   label: "Canceled" },
-  };
-  const c = config[status] || config.pending;
-  return <span className={`badge ${c.cls}`}>{c.label}</span>;
-}
+import StatusIndicator from "./StatusIndicator";
 
 function fmt(iso) {
   if (!iso) return "—";
@@ -23,19 +12,8 @@ function fmt(iso) {
   });
 }
 
-export default function History() {
-  const [jobs, setJobs]         = useState([]);
-  const [loading, setLoading]   = useState(true);
-  const [error, setError]       = useState("");
-  const [dl, setDl]             = useState({});
-
-  useEffect(() => {
-    (async () => {
-      try { setJobs(await api.listJobs()); }
-      catch (e) { setError(e.message); }
-      finally { setLoading(false); }
-    })();
-  }, []);
+export default function RequestsTable({ jobs, emptyLabel = "No requests yet", emptyHint = "Run your first scrape to see requests here." }) {
+  const [dl, setDl] = useState({});
 
   const download = async (jobId, type) => {
     const key = `${jobId}-${type}`;
@@ -45,25 +23,11 @@ export default function History() {
     finally { setDl(p => ({ ...p, [key]: false })); }
   };
 
-  if (loading) return (
-    <div className="card p-10 text-center animate-soft-pulse">
-      <p className="text-sm" style={{ color: "var(--text-3)" }}>Loading history…</p>
-    </div>
-  );
-
-  if (error) return (
-    <div className="p-4 rounded-lg text-sm" style={{
-      background: "rgba(255,77,106,0.08)",
-      border: "1px solid rgba(255,77,106,0.2)",
-      color: "var(--danger)"
-    }}>{error}</div>
-  );
-
   if (jobs.length === 0) return (
     <div className="card p-12 text-center animate-fade-in">
       <p className="text-3xl mb-3">◫</p>
-      <p className="font-medium" style={{ color: "var(--text-2)" }}>No jobs yet</p>
-      <p className="text-sm mt-1" style={{ color: "var(--text-3)" }}>Run your first scrape to see history here.</p>
+      <p className="font-medium" style={{ color: "var(--text-2)" }}>{emptyLabel}</p>
+      <p className="text-sm mt-1" style={{ color: "var(--text-3)" }}>{emptyHint}</p>
     </div>
   );
 
@@ -72,8 +36,8 @@ export default function History() {
       {/* Header */}
       <div className="flex items-center justify-between px-5 py-3.5"
         style={{ borderBottom: "1px solid var(--border)" }}>
-        <p className="text-sm font-semibold" style={{ color: "var(--text)" }}>Job History</p>
-        <span className="badge badge-muted mono">{jobs.length} jobs</span>
+        <p className="text-sm font-semibold" style={{ color: "var(--text)" }}>Requests</p>
+        <span className="badge badge-muted mono">{jobs.length} {jobs.length === 1 ? "request" : "requests"}</span>
       </div>
 
       {/* Desktop table */}
@@ -91,7 +55,7 @@ export default function History() {
           <tbody>
             {jobs.map((job, i) => (
               <tr key={job.id} style={{ borderTop: i > 0 ? "1px solid var(--border)" : "none" }}
-                className="transition-colors" onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.02)"}
+                className="transition-colors" onMouseEnter={e => e.currentTarget.style.background = "var(--row-hover)"}
                 onMouseLeave={e => e.currentTarget.style.background = ""}>
                 <td className="px-4 py-3 font-medium text-sm" style={{ color: "var(--text)" }}>{job.industry}</td>
                 <td className="px-4 py-3 mono text-xs" style={{ color: "var(--text-2)" }}>{job.state}</td>
@@ -99,16 +63,16 @@ export default function History() {
                   title={job.cities.join(", ")}>
                   {job.cities.slice(0,3).join(", ")}{job.cities.length > 3 ? ` +${job.cities.length - 3}` : ""}
                 </td>
-                <td className="px-4 py-3"><StatusBadge status={job.status} /></td>
+                <td className="px-4 py-3"><StatusIndicator status={job.status} variant="business" /></td>
                 <td className="px-4 py-3 mono text-sm font-semibold text-right" style={{ color: "var(--text)" }}>
-                  {(job.total_clean ?? 0).toLocaleString()}
+                  {(job.total_leads ?? 0).toLocaleString()}
                 </td>
                 <td className="px-4 py-3 mono text-sm text-right" style={{ color: "var(--text-2)" }}>
                   {(job.emails_found ?? 0).toLocaleString()}
                 </td>
                 <td className="px-4 py-3 text-xs" style={{ color: "var(--text-3)" }}>{fmt(job.created_at)}</td>
                 <td className="px-4 py-3">
-                  {job.status === "done" ? (
+                  {job.status === "Completed" ? (
                     <div className="flex gap-1.5">
                       <button onClick={() => download(job.id, "with_website")}
                         disabled={dl[`${job.id}-with_website`]}
@@ -138,14 +102,14 @@ export default function History() {
                 <p className="font-semibold text-sm" style={{ color: "var(--text)" }}>{job.industry} — {job.state}</p>
                 <p className="text-xs mt-0.5" style={{ color: "var(--text-3)" }}>{job.cities.join(", ")}</p>
               </div>
-              <StatusBadge status={job.status} />
+              <StatusIndicator status={job.status} variant="business" />
             </div>
             <div className="flex gap-4 text-xs mono" style={{ color: "var(--text-2)" }}>
-              <span><span style={{ color: "var(--text)" }}>{job.total_clean ?? 0}</span> leads</span>
+              <span><span style={{ color: "var(--text)" }}>{job.total_leads ?? 0}</span> leads</span>
               <span><span style={{ color: "var(--text)" }}>{job.emails_found ?? 0}</span> emails</span>
               <span style={{ color: "var(--text-3)" }}>{fmt(job.created_at)}</span>
             </div>
-            {job.status === "done" && (
+            {job.status === "Completed" && (
               <div className="flex gap-2">
                 <button onClick={() => download(job.id, "with_website")} className="badge badge-accent cursor-pointer">⬇ With website</button>
                 <button onClick={() => download(job.id, "no_website")}   className="badge badge-muted cursor-pointer">⬇ No website</button>

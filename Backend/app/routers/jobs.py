@@ -7,14 +7,18 @@ Job endpoints:
   GET    /jobs/{job_id}/download/{file_type}  → signed CSV URL
 """
 
+import logging
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
 
 from app.deps import CurrentUserDep, DBConn
+from app.notifications import create_notification, notify_admins_with_permission
 from app.schemas import CreateJobRequest, JobResponse, JobSummary
+from app.security_utils import safe_filename
 from app.storage import get_signed_url
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -104,6 +108,33 @@ async def create_job(body: CreateJobRequest, user: CurrentUserDep, db: DBConn):
             city,
         )
 
+    # ── Phase 6 hook (§19/§27): best-effort submission notification. No other
+    # change in this file — see the Phase 6 plan's design decision on why Business
+    # Leads submission stays owner-only (the plan-lookup/can_user_scrape gate above
+    # is untouched). ──
+    try:
+        await create_notification(
+            db, user_id=user.id, category="business_updates",
+            type="business_request_submitted", title="Business Leads request submitted",
+            body=f"Your {body.industry} / {body.state} request has been queued.",
+            link_section="get-leads", link_sub_tab="business",
+        )
+    except Exception as notif_exc:
+        log.error(f"Submission notification failed for job {job['id']}: {notif_exc}", exc_info=True)
+
+    # Every operations_admin (+ super admins) gets pinged so a new request
+    # doesn't just sit unnoticed — mirrors people_leads.py's identical pattern.
+    try:
+        await notify_admins_with_permission(
+            db, permission_key="operations_admin",
+            category="business_updates", type="new_business_request",
+            title="New Business Leads request",
+            body=f"{user.email} submitted a new request: {body.industry} / {body.state} ({len(body.cities)} cities).",
+            link_section="business-requests", link_resource_id=str(job["id"]),
+        )
+    except Exception as notif_exc:
+        log.error(f"Admin new-request notification failed for job {job['id']}: {notif_exc}", exc_info=True)
+
     return JobResponse(**dict(job), city_progress=[])
 
 
@@ -173,6 +204,17 @@ async def cancel_job(job_id: UUID, user: CurrentUserDep, db: DBConn):
         "UPDATE jobs SET status = 'canceled', updated_at = NOW() WHERE id = $1",
         job_id,
     )
+
+    try:
+        await create_notification(
+            db, user_id=user.id, category="business_updates",
+            type="business_request_cancelled", title="Business Leads request cancelled",
+            body="Your Business Leads request was cancelled.",
+            link_section="history",
+        )
+    except Exception as notif_exc:
+        log.error(f"Cancellation notification failed for job {job_id}: {notif_exc}", exc_info=True)
+
     return {"message": "Job canceled"}
 
 
@@ -191,7 +233,7 @@ async def download_job(
         raise HTTPException(status_code=400, detail="file_type must be 'with_website' or 'no_website'")
 
     job = await db.fetchrow(
-        "SELECT status, with_web_csv, no_web_csv FROM jobs WHERE id = $1 AND user_id = $2",
+        "SELECT status, industry, state, with_web_csv, no_web_csv FROM jobs WHERE id = $1 AND user_id = $2",
         job_id,
         user.id,
     )
@@ -204,5 +246,7 @@ async def download_job(
     if not path:
         raise HTTPException(status_code=404, detail="File not available for this job")
 
-    signed_url = await get_signed_url(path, expires_in=3600)
+    suffix = "with_website" if file_type == "with_website" else "without_website"
+    filename = safe_filename(f"{job['industry']}_{job['state']}_{suffix}.csv")
+    signed_url = await get_signed_url(path, expires_in=3600, download_filename=filename)
     return {"url": signed_url, "expires_in": 3600}
