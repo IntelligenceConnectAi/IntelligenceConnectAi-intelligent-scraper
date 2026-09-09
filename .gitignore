@@ -15,6 +15,9 @@ Backend/venv/
 node_modules/
 frontend/dist/
 
+# ── Vercel CLI local link/build state (never shared, no secrets, but no reason to commit) ──
+.vercel
+
 # ── Logs ──
 *.log
 
