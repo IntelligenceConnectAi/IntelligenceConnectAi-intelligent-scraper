@@ -96,28 +96,33 @@ async def create_people_lead_request(
     org_id = await get_current_org_id(db, user.id)
     billing_user_id = await get_billing_owner_id(db, user.id, org_id)
 
-    plan_row = await db.fetchrow(
-        """
-        SELECT p.leads_per_month AS monthly_limit, s.current_period_end
-        FROM subscriptions s JOIN plans p ON p.id = s.plan_id
-        WHERE s.user_id = $1 AND s.status = 'active'
-        """,
-        billing_user_id,
-    )
-    if not plan_row:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="No active subscription. Please subscribe to a plan.",
-        )
+    # Company staff (platform admins) submit People Leads requests without the
+    # monthly-lead-limit / subscription gate — matches jobs.py::create_job.
+    privileged = user.platform_role in ("admin", "super_admin")
 
-    monthly_limit = plan_row["monthly_limit"]
-    used = await get_leads_used_period(db, user.id, org_id, plan_row["current_period_end"])
-    if monthly_limit and used + body.requested_quantity > monthly_limit:
-        remaining = max(monthly_limit - used, 0)
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"This request would exceed your monthly lead limit. {remaining} leads remaining this period.",
+    if not privileged:
+        plan_row = await db.fetchrow(
+            """
+            SELECT p.leads_per_month AS monthly_limit, s.current_period_end
+            FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+            WHERE s.user_id = $1 AND s.status = 'active'
+            """,
+            billing_user_id,
         )
+        if not plan_row:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No active subscription. Please subscribe to a plan.",
+            )
+
+        monthly_limit = plan_row["monthly_limit"]
+        used = await get_leads_used_period(db, user.id, org_id, plan_row["current_period_end"])
+        if monthly_limit and used + body.requested_quantity > monthly_limit:
+            remaining = max(monthly_limit - used, 0)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"This request would exceed your monthly lead limit. {remaining} leads remaining this period.",
+            )
 
     instructions = sanitize_formula_injection(body.client_instructions) if body.client_instructions else None
     # Namespaced under "targeting" so it can never collide with the

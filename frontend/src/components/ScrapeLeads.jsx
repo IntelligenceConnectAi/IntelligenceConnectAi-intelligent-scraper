@@ -132,6 +132,9 @@ export default function ScrapeLeads({ plan }) {
   const [activeJobId, setActiveJobId] = useState(null);
 
   const maxCities = plan?.cities_per_job ?? 10;
+  // Admin/staff accounts get an "unlimited" sentinel from /usage/plan — don't
+  // render the ugly counter or the cap warning for them.
+  const noCityCap = maxCities >= 9999;
 
   const commitCity = (text) => {
     const parts = text.split(",").map(c => c.trim()).filter(Boolean);
@@ -218,7 +221,7 @@ export default function ScrapeLeads({ plan }) {
               <label className="label">
                 Cities
                 <span className="ml-2 normal-case" style={{ color: "var(--text-3)", fontWeight: 400 }}>
-                  {cities.length}/{maxCities} · Enter or comma to add
+                  {noCityCap ? cities.length : `${cities.length}/${maxCities}`} · Enter or comma to add
                 </span>
               </label>
 
@@ -247,7 +250,7 @@ export default function ScrapeLeads({ plan }) {
                 />
               </div>
 
-              {cities.length >= maxCities && (
+              {!noCityCap && cities.length >= maxCities && (
                 <p className="text-xs mt-1" style={{ color: "var(--warning)" }}>
                   Max {maxCities} cities reached
                 </p>

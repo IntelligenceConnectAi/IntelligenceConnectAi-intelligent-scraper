@@ -28,57 +28,65 @@ router = APIRouter()
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(body: CreateJobRequest, user: CurrentUserDep, db: DBConn):
 
-    # 1. Load active plan
-    plan = await db.fetchrow(
-        """
-        SELECT p.leads_per_day, p.leads_per_month,
-               p.cities_per_job, p.concurrent_jobs, p.email_scraping
-        FROM subscriptions s
-        JOIN plans p ON p.id = s.plan_id
-        WHERE s.user_id = $1 AND s.status = 'active'
-        LIMIT 1
-        """,
-        user.id,
-    )
-    if not plan:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="No active subscription. Please subscribe to a plan.",
-        )
+    # Company staff (platform admins / super admins) scrape without plan gating:
+    # no active-subscription requirement, no daily/monthly lead cap, no
+    # cities-per-job cap, no per-user concurrent-jobs cap. The worker's own
+    # global concurrency limit still applies to everyone. /usage/plan and
+    # /usage/today report matching "unlimited" values so the UI doesn't block.
+    privileged = user.platform_role in ("admin", "super_admin")
 
-    # 2. Cities limit check
-    max_cities = plan["cities_per_job"]
-    if max_cities and len(body.cities) > max_cities:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Your plan allows max {max_cities} cities per job. You submitted {len(body.cities)}.",
+    if not privileged:
+        # 1. Load active plan
+        plan = await db.fetchrow(
+            """
+            SELECT p.leads_per_day, p.leads_per_month,
+                   p.cities_per_job, p.concurrent_jobs, p.email_scraping
+            FROM subscriptions s
+            JOIN plans p ON p.id = s.plan_id
+            WHERE s.user_id = $1 AND s.status = 'active'
+            LIMIT 1
+            """,
+            user.id,
         )
+        if not plan:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No active subscription. Please subscribe to a plan.",
+            )
 
-    # 3. Daily lead limit check
-    result = await db.fetchrow(
-        "SELECT * FROM can_user_scrape($1, $2)",
-        user.id,
-        len(body.cities) * 60,   # conservative estimate: ~60 leads per city
-    )
-    if result and not result["allowed"]:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=result["reason"],
-        )
+        # 2. Cities limit check
+        max_cities = plan["cities_per_job"]
+        if max_cities and len(body.cities) > max_cities:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Your plan allows max {max_cities} cities per job. You submitted {len(body.cities)}.",
+            )
 
-    # 4. Concurrent jobs check
-    running_count = await db.fetchval(
-        """
-        SELECT COUNT(*) FROM jobs
-        WHERE user_id = $1 AND status IN ('pending', 'running')
-        """,
-        user.id,
-    )
-    if running_count >= plan["concurrent_jobs"]:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"You already have {running_count} active job(s). Your plan allows {plan['concurrent_jobs']} concurrent job(s).",
+        # 3. Daily lead limit check
+        result = await db.fetchrow(
+            "SELECT * FROM can_user_scrape($1, $2)",
+            user.id,
+            len(body.cities) * 60,   # conservative estimate: ~60 leads per city
         )
+        if result and not result["allowed"]:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=result["reason"],
+            )
+
+        # 4. Concurrent jobs check
+        running_count = await db.fetchval(
+            """
+            SELECT COUNT(*) FROM jobs
+            WHERE user_id = $1 AND status IN ('pending', 'running')
+            """,
+            user.id,
+        )
+        if running_count >= plan["concurrent_jobs"]:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"You already have {running_count} active job(s). Your plan allows {plan['concurrent_jobs']} concurrent job(s).",
+            )
 
     # 5. Insert job
     job = await db.fetchrow(
