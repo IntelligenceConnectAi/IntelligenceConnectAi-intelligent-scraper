@@ -26,19 +26,24 @@ log = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════
 # Concurrency caps — were 3/3 with no Phase-1 cap at all (fully sequential
 # city-by-city). Raised as part of a single-instance scale-up (Tier 1), then
-# pulled back down after a real production incident: the live Railway
-# instance has plenty of CPU/RAM headroom (24 vCPU/24GB, observed under 3GB
-# and 5 CPU at failure time), but hit a SEPARATE limit — the container's
-# process/thread ceiling (pthread_create: Resource temporarily unavailable),
-# which Railway doesn't expose a way to raise. That's driven mainly by
-# MAX_CONCURRENT_EMAIL, since each slot there is a full separate Chrome OS
-# process (not just a context, unlike Detail/Cities below) — multiplied by
-# however many jobs run at once (MAX_GLOBAL_CONCURRENT, worker/main.py).
+# pulled back down TWICE after real production incidents:
+#   1st incident: MAX_GLOBAL_CONCURRENT=10 / MAX_CONCURRENT_EMAIL=6 hit the
+#     container's process/thread ceiling (pthread_create: Resource
+#     temporarily unavailable) — NOT a CPU/RAM shortage (24 vCPU/24GB was
+#     barely touched); Railway doesn't expose a way to raise this ceiling.
+#   2nd incident: even the pulled-back 4/3 combo (2 jobs' Phase 3 overlapping
+#     = 6 concurrent full Chrome OS processes — each MAX_CONCURRENT_EMAIL
+#     slot is a real separate process, not just a context like Detail/Cities
+#     below) still cascaded into the same failure — visible as sites that
+#     obviously had an email coming back empty, because a failed browser/
+#     context acquisition used to make exactly one immediate retry and then
+#     permanently give up on that site (fixed below: retry-with-backoff).
 # Re-tune upward only with real evidence of the actual process-count ceiling,
-# not CPU/RAM headroom alone.
-MAX_CONCURRENT_DETAIL = 4
-MAX_CONCURRENT_EMAIL  = 3
-MAX_CONCURRENT_CITIES = 3   # Phase 1 (Maps) — still concurrent (was fully sequential
+# not CPU/RAM headroom alone — and re-test with 2+ jobs running at once,
+# since a single job in isolation does not reproduce this.
+MAX_CONCURRENT_DETAIL = 3
+MAX_CONCURRENT_EMAIL  = 2
+MAX_CONCURRENT_CITIES = 2   # Phase 1 (Maps) — still concurrent (was fully sequential
                             # pre-Tier-1), just at a safer level than the first pass
 PAGE_TIMEOUT_MS       = 15000
 FOOTER_WAIT_MS        = 3000
@@ -763,30 +768,46 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
             ctx = None
             try:
                 async with semaphore:
-                    browser = await get_browser()
-                    # If browser is closed, launch a new one
-                    try:
-                        ctx = await browser.new_context(
-                            viewport={"width": 1280, "height": 900},
-                            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-                        )
-                    except Exception:
-                        # Browser crashed — launch fresh one
+                    # Getting a working browser context can transiently fail
+                    # under real resource pressure (Chrome spawn EAGAIN, or a
+                    # pooled browser that just died) — this used to make
+                    # exactly one immediate retry attempt and, if that also
+                    # failed (likely — the pressure that just killed one
+                    # launch rarely clears within milliseconds), permanently
+                    # gave up on that site with no email. That silently
+                    # zeroed out real, findable emails on sites that were
+                    # never actually visited. Retry with backoff instead.
+                    last_err = None
+                    for attempt in range(3):
+                        if attempt > 0:
+                            await asyncio.sleep(2 * attempt)  # 2s, 4s
+                        browser = await get_browser()
                         try:
-                            new_b = await p.chromium.launch(
-                                channel="chrome", headless=True, slow_mo=0,
-                                args=["--ignore-certificate-errors","--ignore-ssl-errors",
-                                      "--no-sandbox","--disable-dev-shm-usage","--disable-gpu"],
-                            )
-                            browsers.append(new_b)
-                            ctx = await new_b.new_context(
+                            ctx = await browser.new_context(
                                 viewport={"width": 1280, "height": 900},
                                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
                             )
+                            last_err = None
+                            break
                         except Exception as e:
-                            log.error(f"[job {job_id[:8]}] browser recovery failed: {e}")
-                            done[0] += 1
-                            return
+                            last_err = e
+                            # Pooled browser is dead — launch a fresh one for
+                            # the next attempt (also covered by the same
+                            # retry/backoff, unlike the old one-shot fallback).
+                            try:
+                                new_b = await p.chromium.launch(
+                                    channel="chrome", headless=True, slow_mo=0,
+                                    args=["--ignore-certificate-errors","--ignore-ssl-errors",
+                                          "--no-sandbox","--disable-dev-shm-usage","--disable-gpu"],
+                                )
+                                browsers.append(new_b)
+                            except Exception:
+                                pass  # next loop iteration just retries get_browser() again
+
+                    if ctx is None:
+                        log.error(f"[job {job_id[:8]}] browser recovery failed after retries: {last_err}")
+                        done[0] += 1
+                        return
 
                     row["Email"] = await asyncio.wait_for(
                         _crawl_site_for_email(ctx, row["Website"]),
