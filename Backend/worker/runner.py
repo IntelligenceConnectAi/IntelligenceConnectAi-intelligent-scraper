@@ -25,13 +25,21 @@ log = logging.getLogger(__name__)
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════
 # Concurrency caps — were 3/3 with no Phase-1 cap at all (fully sequential
-# city-by-city). Raised as part of a single-instance scale-up (Tier 1): more
-# concurrent headless Chromium contexts per job, sized for a beefier machine
-# (e.g. Railway Pro's 24 vCPU/24GB replica tier), not a hardware-driven ceiling
-# baked into the code — re-tune based on real RAM/CPU observed under load.
-MAX_CONCURRENT_DETAIL = 6
-MAX_CONCURRENT_EMAIL  = 6
-MAX_CONCURRENT_CITIES = 6   # Phase 1 (Maps) — new; previously had no concurrency at all
+# city-by-city). Raised as part of a single-instance scale-up (Tier 1), then
+# pulled back down after a real production incident: the live Railway
+# instance has plenty of CPU/RAM headroom (24 vCPU/24GB, observed under 3GB
+# and 5 CPU at failure time), but hit a SEPARATE limit — the container's
+# process/thread ceiling (pthread_create: Resource temporarily unavailable),
+# which Railway doesn't expose a way to raise. That's driven mainly by
+# MAX_CONCURRENT_EMAIL, since each slot there is a full separate Chrome OS
+# process (not just a context, unlike Detail/Cities below) — multiplied by
+# however many jobs run at once (MAX_GLOBAL_CONCURRENT, worker/main.py).
+# Re-tune upward only with real evidence of the actual process-count ceiling,
+# not CPU/RAM headroom alone.
+MAX_CONCURRENT_DETAIL = 4
+MAX_CONCURRENT_EMAIL  = 3
+MAX_CONCURRENT_CITIES = 3   # Phase 1 (Maps) — still concurrent (was fully sequential
+                            # pre-Tier-1), just at a safer level than the first pass
 PAGE_TIMEOUT_MS       = 15000
 FOOTER_WAIT_MS        = 3000
 # _crawl_site_for_email() tries up to 11 fallback paths per site (PRIORITY_PATHS

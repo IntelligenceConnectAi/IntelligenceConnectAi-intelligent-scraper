@@ -54,10 +54,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Global concurrency limit ──────────────────────────────────
-MAX_GLOBAL_CONCURRENT = 10   # max jobs running at once across all users — was 2;
-                              # raised for a single beefier instance (Tier-1 scale-up,
-                              # no multi-replica changes). Re-tune based on real RAM/CPU
-                              # per headless Chromium instance observed under load.
+# Was 2, raised to 10 for the first Tier-1 pass, then pulled back down after
+# a real production incident on Railway: pthread_create failures under real
+# concurrent load — not a CPU/RAM shortage (24 vCPU/24GB was barely touched),
+# but the container's process/thread ceiling, which multiplies with how many
+# jobs run at once × each job's own browser-process count (worker/runner.py's
+# MAX_CONCURRENT_EMAIL). Re-tune upward only with real evidence of the actual
+# ceiling, not CPU/RAM headroom alone.
+MAX_GLOBAL_CONCURRENT = 4
 
 # ── Resilience tuning ──────────────────────────────────────────
 WATCHDOG_INTERVAL_S = 45       # was 300 (5 min)
