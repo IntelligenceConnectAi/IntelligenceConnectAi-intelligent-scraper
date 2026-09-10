@@ -24,27 +24,34 @@ log = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════
-# Concurrency caps — were 3/3 with no Phase-1 cap at all (fully sequential
-# city-by-city). Raised as part of a single-instance scale-up (Tier 1), then
-# pulled back down TWICE after real production incidents:
-#   1st incident: MAX_GLOBAL_CONCURRENT=10 / MAX_CONCURRENT_EMAIL=6 hit the
-#     container's process/thread ceiling (pthread_create: Resource
-#     temporarily unavailable) — NOT a CPU/RAM shortage (24 vCPU/24GB was
-#     barely touched); Railway doesn't expose a way to raise this ceiling.
-#   2nd incident: even the pulled-back 4/3 combo (2 jobs' Phase 3 overlapping
-#     = 6 concurrent full Chrome OS processes — each MAX_CONCURRENT_EMAIL
-#     slot is a real separate process, not just a context like Detail/Cities
-#     below) still cascaded into the same failure — visible as sites that
-#     obviously had an email coming back empty, because a failed browser/
-#     context acquisition used to make exactly one immediate retry and then
-#     permanently give up on that site (fixed below: retry-with-backoff).
-# Re-tune upward only with real evidence of the actual process-count ceiling,
-# not CPU/RAM headroom alone — and re-test with 2+ jobs running at once,
-# since a single job in isolation does not reproduce this.
-MAX_CONCURRENT_DETAIL = 3
-MAX_CONCURRENT_EMAIL  = 2
-MAX_CONCURRENT_CITIES = 2   # Phase 1 (Maps) — still concurrent (was fully sequential
-                            # pre-Tier-1), just at a safer level than the first pass
+# ── Concurrency, sized against a MEASURED ceiling ──
+# The binding limit on this Railway container is the cgroup process/thread
+# ceiling: /sys/fs/cgroup/pids.max = 1000 (processes + threads combined).
+# NOT CPU/RAM — 24 vCPU/24GB sat near-idle during two separate incidents on
+# 2026-09-10 that were really pthread_create/Chrome-spawn EAGAIN failures.
+# Railway exposes no way to raise pids.max.
+#
+# Measured costs on the actual container (see PERFORMANCE_BASELINE.md):
+#   idle worker ...................... ~75 pids
+#   one full Chrome browser process .. ~100 pids
+#   +1 context+page on that browser .. ~30 pids   <- 3x cheaper than a browser
+#   whole separate browser + 1 page .. ~132 pids
+#
+# So the lever is: share a SMALL pool of browser processes across MANY
+# contexts, instead of one process per concurrent crawl. Phase 1 and Phase 2
+# already do this. Phase 3 now does too (EMAIL_BROWSER_POOL_SIZE decoupled
+# from MAX_CONCURRENT_EMAIL, 2026-09-10 Step 2).
+#
+# Peak budget check, worst case (2 jobs, both deep in Phase 3):
+#   2 * (EMAIL_BROWSER_POOL_SIZE*100 + MAX_CONCURRENT_EMAIL*30) + 75 idle
+#   = 2 * (2*100 + 4*30) + 75 = ~715 pids  -> ~285 under the 1000 ceiling.
+# Re-test any increase with 2+ jobs running at once — a single job in
+# isolation does not reproduce the ceiling.
+EMAIL_BROWSER_POOL_SIZE = 2   # actual Chrome processes in Phase 3's pool (~100 pids each)
+MAX_CONCURRENT_EMAIL    = 4   # concurrent site crawls in Phase 3 — contexts spread
+                              # round-robin across the pool above (~30 pids each)
+MAX_CONCURRENT_DETAIL   = 4   # Phase 2 — contexts on 1 shared browser
+MAX_CONCURRENT_CITIES   = 3   # Phase 1 (Maps) — contexts on 1 shared browser
 PAGE_TIMEOUT_MS       = 15000
 FOOTER_WAIT_MS        = 3000
 # _crawl_site_for_email() tries up to 11 fallback paths per site (PRIORITY_PATHS
@@ -714,10 +721,14 @@ async def _crawl_site_for_email(ctx, start_url):
 
 async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.DataFrame:
     """
-    Email scraping using a BROWSER POOL.
-    Launch MAX_CONCURRENT_EMAIL browsers once — reuse them across all sites.
-    Each site gets a fresh context within a shared browser.
-    This avoids forking hundreds of Chrome processes (BlockingIOError fix).
+    Email scraping using a small BROWSER POOL shared across many contexts.
+    Launch EMAIL_BROWSER_POOL_SIZE browsers once and reuse them across all
+    sites; run up to MAX_CONCURRENT_EMAIL crawls at a time, each in its own
+    fresh context assigned round-robin to a pooled browser. Decoupling the
+    two (2026-09-10) keeps the process/thread count low — a full browser is
+    ~100 pids, an extra context only ~30 — while still crawling several sites
+    in parallel. Also avoids forking hundreds of Chrome processes over a long
+    job (the original BlockingIOError fix).
     """
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_EMAIL)
     total     = len(df)
@@ -727,7 +738,7 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
     async with async_playwright() as p:
         # ── Launch browser pool once ──
         browsers = []
-        for _ in range(MAX_CONCURRENT_EMAIL):
+        for _ in range(EMAIL_BROWSER_POOL_SIZE):
             try:
                 b = await p.chromium.launch(
                     channel="chrome",
@@ -823,14 +834,14 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                     except asyncio.CancelledError: raise
                     except Exception: pass
                 done[0] += 1
-                # Checkpoint every completion, not every 10 — a batch of 10 at only
-                # MAX_CONCURRENT_EMAIL=3 concurrent slots, each individually allowed up
-                # to EMAIL_CRAWL_TIMEOUT=30s, has no real headroom against the watchdog's
-                # 5-minute stuck threshold: a real run hit a 5m13s gap between two
-                # every-10 checkpoints (mostly successful-but-slow page loads, not even
-                # all timeouts) and got wrongly killed as "stalled" while still actively
-                # working. Checkpointing every item removes that risk at negligible cost
-                # (one cheap UPDATE per ~10-30s per worker slot).
+                # Write progress on every completion, not every 10 — at low
+                # concurrency with a per-site budget up to EMAIL_CRAWL_TIMEOUT,
+                # a batch of 10 has no real headroom against the watchdog's
+                # stuck threshold: a real run once hit a 5m13s gap between two
+                # every-10 writes (mostly successful-but-slow page loads, not
+                # even all timeouts) and got wrongly killed as "stalled" while
+                # still actively working. Writing every item removes that risk
+                # at negligible cost (one cheap UPDATE per ~10-30s per slot).
                 found = sum(1 for r in records if r.get("Email"))
                 if done[0] % 10 == 0 or done[0] == total:
                     log.info(f"[job {job_id[:8]}] email progress: {done[0]}/{total} | found: {found}")
