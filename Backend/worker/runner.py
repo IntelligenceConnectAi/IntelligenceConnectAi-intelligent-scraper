@@ -31,27 +31,28 @@ log = logging.getLogger(__name__)
 # 2026-09-10 that were really pthread_create/Chrome-spawn EAGAIN failures.
 # Railway exposes no way to raise pids.max.
 #
-# Measured costs on the actual container (see PERFORMANCE_BASELINE.md):
-#   idle worker ...................... ~75 pids
-#   one full Chrome browser process .. ~100 pids
-#   +1 context+page on that browser .. ~30 pids   <- 3x cheaper than a browser
-#   whole separate browser + 1 page .. ~132 pids
-#
 # So the lever is: share a SMALL pool of browser processes across MANY
 # contexts, instead of one process per concurrent crawl. Phase 1 and Phase 2
 # already do this. Phase 3 now does too (EMAIL_BROWSER_POOL_SIZE decoupled
 # from MAX_CONCURRENT_EMAIL, 2026-09-10 Step 2).
 #
-# Peak budget check, worst case (2 jobs, both deep in Phase 3):
-#   2 * (EMAIL_BROWSER_POOL_SIZE*100 + MAX_CONCURRENT_EMAIL*30) + 75 idle
-#   = 2 * (2*100 + 4*30) + 75 = ~715 pids  -> ~285 under the 1000 ceiling.
-# Re-test any increase with 2+ jobs running at once — a single job in
-# isolation does not reproduce the ceiling.
+# Step 2 was validated live with a 2-concurrent-job stress test and DIRECT
+# cgroup readings (/sys/fs/cgroup/pids.peak). The naive steady-state math
+# badly underestimated the real peak — Chrome's launch-time transient fork
+# spike plus Phase 1/2 browsers briefly overlapping Phase 3 startup add a
+# lot. Measured peaks, 2 concurrent jobs:
+#   4 / 4 / 3  (EMAIL / DETAIL / CITIES) -> pids.peak 982 / 1000  (18 margin — too tight)
+#   3 / 3 / 2                            -> pids.peak ~??? (this config; target <=880)
+# pids.events "max" stayed 0 throughout (no fork was ever actually denied),
+# jobs completed clean — but 18 pids of headroom is not a margin to run
+# production on, hence this pullback. Still ~1.6-2x the pre-Step-2 Phase 3
+# throughput. Re-measure pids.peak (not just "did it error") before any
+# future increase, always with 2+ jobs running at once.
 EMAIL_BROWSER_POOL_SIZE = 2   # actual Chrome processes in Phase 3's pool (~100 pids each)
-MAX_CONCURRENT_EMAIL    = 4   # concurrent site crawls in Phase 3 — contexts spread
+MAX_CONCURRENT_EMAIL    = 3   # concurrent site crawls in Phase 3 — contexts spread
                               # round-robin across the pool above (~30 pids each)
-MAX_CONCURRENT_DETAIL   = 4   # Phase 2 — contexts on 1 shared browser
-MAX_CONCURRENT_CITIES   = 3   # Phase 1 (Maps) — contexts on 1 shared browser
+MAX_CONCURRENT_DETAIL   = 3   # Phase 2 — contexts on 1 shared browser
+MAX_CONCURRENT_CITIES   = 2   # Phase 1 (Maps) — contexts on 1 shared browser
 PAGE_TIMEOUT_MS       = 15000
 FOOTER_WAIT_MS        = 3000
 # _crawl_site_for_email() tries up to 11 fallback paths per site (PRIORITY_PATHS
