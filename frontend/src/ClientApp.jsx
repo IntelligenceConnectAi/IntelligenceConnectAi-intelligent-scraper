@@ -43,7 +43,10 @@ export default function ClientApp({ session, onLogout, onSwitchToAdminView, them
   const [dashError, setDashError]     = useState("");
 
   // ── Load profile + plan (refetched when the top-level section changes, e.g.
-  // returning to Dashboard/Settings after a Stripe checkout/portal round trip) ──
+  // returning to Dashboard/Settings after a Stripe checkout/portal round trip).
+  // Keyed on the user id, not the raw `session` object — supabase-js hands us a
+  // new session object on every tab-focus / token refresh, and depending on it
+  // directly would refetch the whole shell each time the user tabs back in. ──
   useEffect(() => {
     if (!session) return;
     (async () => {
@@ -70,7 +73,8 @@ export default function ClientApp({ session, onLogout, onSwitchToAdminView, them
         setDashLoading(false);
       }
     })();
-  }, [session, activeSection]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.user?.id, activeSection]);
 
   const handleNavigate = (section, subTab = null) => {
     setActiveSection(section);

@@ -51,7 +51,17 @@ export default function App() {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session); setAuthLoading(false);
     });
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
+      // supabase-js re-emits the session every time the tab regains focus and
+      // on each silent token refresh — always as a fresh object, even for the
+      // same logged-in user. Downstream effects key on `session`, so passing
+      // every re-emit through briefly unmounts the whole post-login app behind
+      // the gate spinner and refetches everything. Only propagate a real
+      // identity change (login / logout / account switch). The live access
+      // token is read fresh from supabase.auth.getSession() in api.js on every
+      // request, so a same-user refresh needs no React state update.
+      setSession(prev => (prev?.user?.id === s?.user?.id ? prev : s));
+    });
     return () => sub.subscription.unsubscribe();
   }, []);
 
