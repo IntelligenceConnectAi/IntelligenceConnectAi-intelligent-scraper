@@ -793,12 +793,19 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
         async def process_one(row):
             if not str(row.get("Website", "")).strip():
                 return
+            # Checked before the semaphore (and before entering the try/finally
+            # below that counts done[0]/emails_attempted): once cancelled, every
+            # already-queued item behind the semaphore gets to run near-instantly
+            # (no real work, just this check), which raced emails_attempted to
+            # 503/503 on a job that only genuinely tried ~40 sites before the
+            # user cancelled it. Checking here means a skipped item is never
+            # counted as "attempted" at all, and skips don't even wait for a slot.
+            if await _is_job_canceled(pool, job_id):
+                return
             row["Email"] = ""
             ctx = None
             try:
                 async with semaphore:
-                    if await _is_job_canceled(pool, job_id):
-                        return
                     # Getting a working browser context can transiently fail
                     # under real resource pressure (Chrome spawn EAGAIN, or a
                     # pooled browser that just died) — this used to make
