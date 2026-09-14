@@ -572,47 +572,59 @@ async def _enrich_missing(records: list, pool: asyncpg.Pool, job_id: str) -> lis
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(channel="chrome", headless=True, slow_mo=0)
-        sem = asyncio.Semaphore(MAX_CONCURRENT_DETAIL)
+        # try/finally guarantees browser.close() runs even if this is cancelled
+        # externally (watchdog rescuing a stuck job) — without it, cancellation
+        # skips straight past the close() below and leaks a live Chrome process
+        # (not a zombie — tini can't reap something that's still running).
+        try:
+            sem = asyncio.Semaphore(MAX_CONCURRENT_DETAIL)
 
-        async def fetch_one(row):
-            async with sem:
-                if await _is_job_canceled(pool, job_id):
-                    return
-                ctx = await browser.new_context(
-                    viewport={"width": 1280, "height": 900},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-                )
-                page = await ctx.new_page()
-                try:
-                    await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,ico,mp4,mp3}", lambda r: r.abort())
-                    await page.goto(row["Maps_URL"], timeout=int(MAPS_DETAIL_TIMEOUT * 1000), wait_until="domcontentloaded")
-                    await asyncio.sleep(0.5)
-                    data = await page.evaluate(_DETAIL_JS)
-                    if data.get("website") and not str(row.get("Website","")).strip():
-                        row["Website"] = data["website"]
-                    if data.get("phone") and not str(row.get("Phone","")).strip():
-                        row["Phone"] = format_phone(data["phone"])
-                except Exception as e:
-                    pass
-                finally:
-                    try: await page.close()
-                    except: pass
-                    try: await ctx.close()
-                    except: pass
-                    # Checkpoint updated_at periodically — without this, a batch large
-                    # enough to take >5min at MAX_CONCURRENT_DETAIL looks "stuck" to the
-                    # watchdog (worker/main.py) and gets killed + retried even though it's
-                    # still legitimately working. Mirrors the Phase 3 email-crawl pattern.
-                    done[0] += 1
-                    if done[0] % 10 == 0 or done[0] == total:
-                        enriched_so_far = sum(1 for r in records if str(r.get("Website","")).strip())
-                        try:
-                            await _update_job(pool, job_id, with_website=enriched_so_far)
-                        except Exception as e:
-                            log.error(f"[job {job_id[:8]}] DB update error: {e}")
+            async def fetch_one(row):
+                async with sem:
+                    if await _is_job_canceled(pool, job_id):
+                        return
+                    ctx = await browser.new_context(
+                        viewport={"width": 1280, "height": 900},
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+                    )
+                    page = await ctx.new_page()
+                    try:
+                        await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,ico,mp4,mp3}", lambda r: r.abort())
+                        await page.goto(row["Maps_URL"], timeout=int(MAPS_DETAIL_TIMEOUT * 1000), wait_until="domcontentloaded")
+                        await asyncio.sleep(0.5)
+                        data = await page.evaluate(_DETAIL_JS)
+                        if data.get("website") and not str(row.get("Website","")).strip():
+                            row["Website"] = data["website"]
+                        if data.get("phone") and not str(row.get("Phone","")).strip():
+                            row["Phone"] = format_phone(data["phone"])
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
+                    finally:
+                        try: await page.close()
+                        except asyncio.CancelledError: raise
+                        except Exception: pass
+                        try: await ctx.close()
+                        except asyncio.CancelledError: raise
+                        except Exception: pass
+                        # Checkpoint updated_at periodically — without this, a batch large
+                        # enough to take >5min at MAX_CONCURRENT_DETAIL looks "stuck" to the
+                        # watchdog (worker/main.py) and gets killed + retried even though it's
+                        # still legitimately working. Mirrors the Phase 3 email-crawl pattern.
+                        done[0] += 1
+                        if done[0] % 10 == 0 or done[0] == total:
+                            enriched_so_far = sum(1 for r in records if str(r.get("Website","")).strip())
+                            try:
+                                await _update_job(pool, job_id, with_website=enriched_so_far)
+                            except Exception as e:
+                                log.error(f"[job {job_id[:8]}] DB update error: {e}")
 
-        await asyncio.gather(*[fetch_one(r) for r in missing], return_exceptions=True)
-        await browser.close()
+            await asyncio.gather(*[fetch_one(r) for r in missing], return_exceptions=True)
+        finally:
+            try: await browser.close()
+            except asyncio.CancelledError: raise
+            except Exception: pass
 
     enriched_web = sum(1 for r in records if str(r.get("Website","")).strip())
     log.info(f"[job {job_id[:8]}] after enrichment: {enriched_web} with website")
@@ -780,120 +792,132 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
 
         log.info(f"[job {job_id[:8]}] email browser pool: {len(browsers)} browsers ready")
 
-        # Round-robin browser assignment
-        browser_idx = [0]
-        browser_lock = asyncio.Lock()
+        # ── Everything from here on is wrapped in try/finally: without it, an
+        # external cancellation (the watchdog rescuing a stuck job, or a future
+        # cancel path) skips straight past "Close all browsers" below and leaks
+        # every browser in the pool as a genuinely still-running orphaned
+        # process — not a zombie, so 2026-09-13's tini fix does nothing for
+        # this. Confirmed as a real incident: a stuck job's cancelled task left
+        # its browser(s) running, and the next job's Phase 1 browser launch
+        # then failed instantly with "Target page, context or browser has been
+        # closed" on every single city, completing as "done" with 0 leads.
+        try:
+            # Round-robin browser assignment
+            browser_idx = [0]
+            browser_lock = asyncio.Lock()
 
-        async def get_browser():
-            async with browser_lock:
-                b = browsers[browser_idx[0] % len(browsers)]
-                browser_idx[0] += 1
-                return b
+            async def get_browser():
+                async with browser_lock:
+                    b = browsers[browser_idx[0] % len(browsers)]
+                    browser_idx[0] += 1
+                    return b
 
-        async def process_one(row):
-            if not str(row.get("Website", "")).strip():
-                return
-            # Checked before the semaphore (and before entering the try/finally
-            # below that counts done[0]/emails_attempted): once cancelled, every
-            # already-queued item behind the semaphore gets to run near-instantly
-            # (no real work, just this check), which raced emails_attempted to
-            # 503/503 on a job that only genuinely tried ~40 sites before the
-            # user cancelled it. Checking here means a skipped item is never
-            # counted as "attempted" at all, and skips don't even wait for a slot.
-            if await _is_job_canceled(pool, job_id):
-                return
-            row["Email"] = ""
-            ctx = None
-            try:
-                async with semaphore:
-                    # Getting a working browser context can transiently fail
-                    # under real resource pressure (Chrome spawn EAGAIN, or a
-                    # pooled browser that just died) — this used to make
-                    # exactly one immediate retry attempt and, if that also
-                    # failed (likely — the pressure that just killed one
-                    # launch rarely clears within milliseconds), permanently
-                    # gave up on that site with no email. That silently
-                    # zeroed out real, findable emails on sites that were
-                    # never actually visited. Retry with backoff instead.
-                    last_err = None
-                    for attempt in range(3):
-                        if attempt > 0:
-                            await asyncio.sleep(2 * attempt)  # 2s, 4s
-                        browser = await get_browser()
-                        try:
-                            ctx = await browser.new_context(
-                                viewport={"width": 1280, "height": 900},
-                                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-                            )
-                            last_err = None
-                            break
-                        except Exception as e:
-                            last_err = e
-                            # Pooled browser is dead — launch a fresh one for
-                            # the next attempt (also covered by the same
-                            # retry/backoff, unlike the old one-shot fallback).
-                            try:
-                                new_b = await p.chromium.launch(
-                                    channel="chrome", headless=True, slow_mo=0,
-                                    args=["--ignore-certificate-errors","--ignore-ssl-errors",
-                                          "--no-sandbox","--disable-dev-shm-usage","--disable-gpu"],
-                                )
-                                browsers.append(new_b)
-                            except Exception:
-                                pass  # next loop iteration just retries get_browser() again
-
-                    if ctx is None:
-                        log.error(f"[job {job_id[:8]}] browser recovery failed after retries: {last_err}")
-                        done[0] += 1
-                        return
-
-                    row["Email"] = await asyncio.wait_for(
-                        _crawl_site_for_email(ctx, row["Website"]),
-                        timeout=EMAIL_CRAWL_TIMEOUT,
-                    )
-            except asyncio.TimeoutError:
-                log.warning(f"[job {job_id[:8]}] email timeout: {row.get('Website')}")
-            except Exception as e:
-                log.warning(f"[job {job_id[:8]}] email error: {type(e).__name__}")
-            finally:
-                if ctx:
-                    try: await ctx.close()
-                    except asyncio.CancelledError: raise
-                    except Exception: pass
-                done[0] += 1
-                # Write progress on every completion, not every 10 — at low
-                # concurrency with a per-site budget up to EMAIL_CRAWL_TIMEOUT,
-                # a batch of 10 has no real headroom against the watchdog's
-                # stuck threshold: a real run once hit a 5m13s gap between two
-                # every-10 writes (mostly successful-but-slow page loads, not
-                # even all timeouts) and got wrongly killed as "stalled" while
-                # still actively working. Writing every item removes that risk
-                # at negligible cost (one cheap UPDATE per ~10-30s per slot).
-                found = sum(1 for r in records if r.get("Email"))
-                if done[0] % 10 == 0 or done[0] == total:
-                    log.info(f"[job {job_id[:8]}] email progress: {done[0]}/{total} | found: {found}")
+            async def process_one(row):
+                if not str(row.get("Website", "")).strip():
+                    return
+                # Checked before the semaphore (and before entering the try/finally
+                # below that counts done[0]/emails_attempted): once cancelled, every
+                # already-queued item behind the semaphore gets to run near-instantly
+                # (no real work, just this check), which raced emails_attempted to
+                # 503/503 on a job that only genuinely tried ~40 sites before the
+                # user cancelled it. Checking here means a skipped item is never
+                # counted as "attempted" at all, and skips don't even wait for a slot.
+                if await _is_job_canceled(pool, job_id):
+                    return
+                row["Email"] = ""
+                ctx = None
                 try:
-                    await _update_job(pool, job_id,
-                                      emails_attempted=done[0],
-                                      emails_found=found)
+                    async with semaphore:
+                        # Getting a working browser context can transiently fail
+                        # under real resource pressure (Chrome spawn EAGAIN, or a
+                        # pooled browser that just died) — this used to make
+                        # exactly one immediate retry attempt and, if that also
+                        # failed (likely — the pressure that just killed one
+                        # launch rarely clears within milliseconds), permanently
+                        # gave up on that site with no email. That silently
+                        # zeroed out real, findable emails on sites that were
+                        # never actually visited. Retry with backoff instead.
+                        last_err = None
+                        for attempt in range(3):
+                            if attempt > 0:
+                                await asyncio.sleep(2 * attempt)  # 2s, 4s
+                            browser = await get_browser()
+                            try:
+                                ctx = await browser.new_context(
+                                    viewport={"width": 1280, "height": 900},
+                                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+                                )
+                                last_err = None
+                                break
+                            except Exception as e:
+                                last_err = e
+                                # Pooled browser is dead — launch a fresh one for
+                                # the next attempt (also covered by the same
+                                # retry/backoff, unlike the old one-shot fallback).
+                                try:
+                                    new_b = await p.chromium.launch(
+                                        channel="chrome", headless=True, slow_mo=0,
+                                        args=["--ignore-certificate-errors","--ignore-ssl-errors",
+                                              "--no-sandbox","--disable-dev-shm-usage","--disable-gpu"],
+                                    )
+                                    browsers.append(new_b)
+                                except Exception:
+                                    pass  # next loop iteration just retries get_browser() again
+
+                        if ctx is None:
+                            log.error(f"[job {job_id[:8]}] browser recovery failed after retries: {last_err}")
+                            done[0] += 1
+                            return
+
+                        row["Email"] = await asyncio.wait_for(
+                            _crawl_site_for_email(ctx, row["Website"]),
+                            timeout=EMAIL_CRAWL_TIMEOUT,
+                        )
+                except asyncio.TimeoutError:
+                    log.warning(f"[job {job_id[:8]}] email timeout: {row.get('Website')}")
                 except Exception as e:
-                    log.error(f"[job {job_id[:8]}] DB update error: {e}")
+                    log.warning(f"[job {job_id[:8]}] email error: {type(e).__name__}")
+                finally:
+                    if ctx:
+                        try: await ctx.close()
+                        except asyncio.CancelledError: raise
+                        except Exception: pass
+                    done[0] += 1
+                    # Write progress on every completion, not every 10 — at low
+                    # concurrency with a per-site budget up to EMAIL_CRAWL_TIMEOUT,
+                    # a batch of 10 has no real headroom against the watchdog's
+                    # stuck threshold: a real run once hit a 5m13s gap between two
+                    # every-10 writes (mostly successful-but-slow page loads, not
+                    # even all timeouts) and got wrongly killed as "stalled" while
+                    # still actively working. Writing every item removes that risk
+                    # at negligible cost (one cheap UPDATE per ~10-30s per slot).
+                    found = sum(1 for r in records if r.get("Email"))
+                    if done[0] % 10 == 0 or done[0] == total:
+                        log.info(f"[job {job_id[:8]}] email progress: {done[0]}/{total} | found: {found}")
+                    try:
+                        await _update_job(pool, job_id,
+                                          emails_attempted=done[0],
+                                          emails_found=found)
+                    except Exception as e:
+                        log.error(f"[job {job_id[:8]}] DB update error: {e}")
 
-        async def safe_process(r):
-            try:
-                await process_one(r)
-            except Exception as e:
-                log.error(f"[job {job_id[:8]}] task error: {e}")
+            async def safe_process(r):
+                try:
+                    await process_one(r)
+                except Exception as e:
+                    log.error(f"[job {job_id[:8]}] task error: {e}")
 
-        await asyncio.gather(
-            *[safe_process(r) for r in records if str(r.get("Website","")).strip()],
-            return_exceptions=True,
-        )
-
-        # Close all browsers
-        for b in browsers:
-            try: await b.close()
-            except: pass
+            await asyncio.gather(
+                *[safe_process(r) for r in records if str(r.get("Website","")).strip()],
+                return_exceptions=True,
+            )
+        finally:
+            # Close all browsers — guaranteed to run even if the above was
+            # cancelled externally (see comment above the try).
+            for b in browsers:
+                try: await b.close()
+                except asyncio.CancelledError: raise
+                except Exception: pass
 
     return pd.DataFrame(records)
 
@@ -1005,42 +1029,54 @@ async def run_scrape_job(
                 # closes its own context, so no extra cleanup needed here.
                 async with async_playwright() as p:
                     browser = await p.chromium.launch(channel="chrome", headless=True, slow_mo=0)
-                    city_sem = asyncio.Semaphore(MAX_CONCURRENT_CITIES)
-                    raw_total  = [0]
-                    done_total = [0]
+                    # try/finally guarantees browser.close() runs even if this is
+                    # cancelled externally (watchdog rescuing a stuck job) —
+                    # without it, cancellation skips straight past the close()
+                    # below and leaks a live Chrome process (not a zombie — tini
+                    # can't reap something that's still running). Confirmed as a
+                    # real incident: a stuck job's cancelled task left its Phase 1
+                    # browser running, and the next job's own browser launch then
+                    # failed instantly on every single city.
+                    try:
+                        city_sem = asyncio.Semaphore(MAX_CONCURRENT_CITIES)
+                        raw_total  = [0]
+                        done_total = [0]
 
-                    async def scrape_one_city(city):
-                        async with city_sem:
-                            if await _is_job_canceled(pool, job_id):
-                                return
-                            await _update_job(pool, job_id, current_city=city)
-                            try:
-                                rows = await asyncio.wait_for(
-                                    _scrape_city(city, state, industry, browser, out_dir, pool, job_id),
-                                    timeout=CITY_SCRAPE_TIMEOUT_S,
-                                )
-                            except asyncio.CancelledError:
-                                raise
-                            except asyncio.TimeoutError:
-                                log.error(f"[job {job_id[:8]}] {city} scrape timed out after {CITY_SCRAPE_TIMEOUT_S}s")
-                                await _update_city(pool, job_id, city, maps_status="failed", error="City scrape timed out")
-                                rows = []
-                            except Exception as e:
-                                log.error(f"[job {job_id[:8]}] unexpected error scraping {city}: {e}")
-                                await _update_city(pool, job_id, city, maps_status="failed", error=str(e)[:200])
-                                rows = []
-                            # Update progress on every completion (not batched) —
-                            # same reasoning as Phase 2/3: with several cities
-                            # in flight at once, batching would let the watchdog
-                            # see a long gap with zero DB writes and misfire.
-                            raw_total[0]  += len(rows)
-                            done_total[0] += 1
-                            await _update_job(pool, job_id, cities_done=done_total[0], total_raw=raw_total[0])
+                        async def scrape_one_city(city):
+                            async with city_sem:
+                                if await _is_job_canceled(pool, job_id):
+                                    return
+                                await _update_job(pool, job_id, current_city=city)
+                                try:
+                                    rows = await asyncio.wait_for(
+                                        _scrape_city(city, state, industry, browser, out_dir, pool, job_id),
+                                        timeout=CITY_SCRAPE_TIMEOUT_S,
+                                    )
+                                except asyncio.CancelledError:
+                                    raise
+                                except asyncio.TimeoutError:
+                                    log.error(f"[job {job_id[:8]}] {city} scrape timed out after {CITY_SCRAPE_TIMEOUT_S}s")
+                                    await _update_city(pool, job_id, city, maps_status="failed", error="City scrape timed out")
+                                    rows = []
+                                except Exception as e:
+                                    log.error(f"[job {job_id[:8]}] unexpected error scraping {city}: {e}")
+                                    await _update_city(pool, job_id, city, maps_status="failed", error=str(e)[:200])
+                                    rows = []
+                                # Update progress on every completion (not batched) —
+                                # same reasoning as Phase 2/3: with several cities
+                                # in flight at once, batching would let the watchdog
+                                # see a long gap with zero DB writes and misfire.
+                                raw_total[0]  += len(rows)
+                                done_total[0] += 1
+                                await _update_job(pool, job_id, cities_done=done_total[0], total_raw=raw_total[0])
 
-                    await asyncio.gather(*[scrape_one_city(city) for city in cities],
-                                        return_exceptions=True)
-                    total_raw = raw_total[0]
-                    await browser.close()
+                        await asyncio.gather(*[scrape_one_city(city) for city in cities],
+                                            return_exceptions=True)
+                        total_raw = raw_total[0]
+                    finally:
+                        try: await browser.close()
+                        except asyncio.CancelledError: raise
+                        except Exception: pass
 
                 await _update_job(pool, job_id, current_step="step2_preprocess", maps_done_at="NOW()")
 
