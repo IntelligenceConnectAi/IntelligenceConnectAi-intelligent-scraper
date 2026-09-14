@@ -114,10 +114,13 @@ class PoolHolder:
             new_pool = await asyncio.wait_for(
                 asyncpg.create_pool(
                     settings.database_url,
-                    # Sized for MAX_GLOBAL_CONCURRENT=10 jobs each writing progress
-                    # from several concurrent browser slots — was min=2/max=5, too
-                    # small once 10+ jobs can be live at once instead of 2.
-                    min_size=5, max_size=25,
+                    # Supabase's session-mode pooler here caps at 15 total client
+                    # connections, shared with app/db.py's API pool (max_size=5) — the
+                    # old min=5/max=25 here (sized for a since-pulled-back
+                    # MAX_GLOBAL_CONCURRENT=10 plan) could alone exceed 15, starving the
+                    # API and 500ing every /auth/me and /notifications call whenever a
+                    # job was actively running (2026-09-14 EMAXCONNSESSION incident).
+                    min_size=3, max_size=8,
                     command_timeout=60, statement_cache_size=0, timeout=10,
                 ),
                 timeout=15,
@@ -379,12 +382,10 @@ async def main() -> None:
 
     pool = await asyncpg.create_pool(
         settings.database_url,
-        # Sized for MAX_GLOBAL_CONCURRENT=10 jobs each writing progress from
-        # several concurrent browser slots — was min=2/max=5, too small once
-        # 10+ jobs can be live at once instead of 2. Must match PoolHolder.recreate()'s
-        # sizing above so a mid-run pool recreation doesn't quietly shrink capacity.
-        min_size=5,
-        max_size=25,
+        # Must match PoolHolder.recreate()'s sizing above — see the comment there
+        # for why this is capped well under Supabase's 15-connection pooler limit.
+        min_size=3,
+        max_size=8,
         command_timeout=60,
         statement_cache_size=0,
     )

@@ -18,8 +18,13 @@ async def init_db_pool() -> None:
     global _pool
     _pool = await asyncpg.create_pool(
         settings.database_url,
+        # Supabase's session-mode pooler here caps at 15 total client connections,
+        # shared with the worker service's own pool (min=3/max=8, see
+        # worker/main.py) — keep the two sums comfortably under 15 or every
+        # request here starts 500ing with EMAXCONNSESSION whenever the worker's
+        # pool is busy (2026-09-14 incident).
         min_size=2,
-        max_size=10,
+        max_size=5,
         command_timeout=30,
         statement_cache_size=0,  # required for Supabase pooler (pgbouncer)
     )

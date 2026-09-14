@@ -30,6 +30,8 @@ export default function App() {
   // independent of ClientApp's own profile/plan state ──
   const [gateProfile, setGateProfile]   = useState(null);
   const [gateLoading, setGateLoading]   = useState(false);
+  const [gateError, setGateError]       = useState("");
+  const [gateRetryTick, setGateRetryTick] = useState(0);
   const [viewMode, setViewMode]         = useState(
     () => new URLSearchParams(window.location.search).get("view")
   );
@@ -68,13 +70,16 @@ export default function App() {
   // ── Gate-keeping profile fetch — learns platform_role once per session,
   // not on every navigation (see AdminApp/ClientApp split rationale) ──
   useEffect(() => {
-    if (!session) { setGateProfile(null); return; }
-    setGateLoading(true);
+    if (!session) { setGateProfile(null); setGateError(""); return; }
+    setGateLoading(true); setGateError("");
     api.me()
       .then(setGateProfile)
-      .catch(() => setGateProfile(null))
+      // A transient failure here (e.g. the backend momentarily out of DB
+      // connections) must not leave the user stuck on the loading spinner
+      // forever with no way out — surface it and offer a retry instead.
+      .catch((e) => { setGateProfile(null); setGateError(e.message || "Couldn't load your account."); })
       .finally(() => setGateLoading(false));
-  }, [session]);
+  }, [session, gateRetryTick]);
 
   // ── Handlers ──
   const handleLogin = async (e) => {
@@ -216,6 +221,21 @@ export default function App() {
             </button>
           </form>
         )}
+      </div>
+    </div>
+  );
+
+  if (gateError) return (
+    <div className="flex min-h-screen items-center justify-center px-4" style={{ background: "var(--bg)" }}>
+      <div className="flex flex-col items-center gap-3 text-center max-w-sm">
+        <p className="text-sm" style={{ color: "var(--text)" }}>Couldn't load your account.</p>
+        <p className="text-xs muted-text">{gateError}</p>
+        <button
+          onClick={() => setGateRetryTick(t => t + 1)}
+          className="btn-primary mt-1"
+        >
+          Retry
+        </button>
       </div>
     </div>
   );
