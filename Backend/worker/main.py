@@ -162,39 +162,47 @@ async def _process_job(job: dict, pool: asyncpg.Pool) -> None:
             delete_fn      = _delete,
         )
 
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "SELECT update_usage_after_job($1,$2,$3,$4,$5,$6)",
-                job["user_id"],
-                result["total_clean"],
-                result["with_website"],
-                result["no_website"],
-                result["emails_found"],
-                result["with_website"],
-            )
-
-        # ── Phase 5 hook (§27): index completed outputs into lead_files. ──
-        # Isolated on purpose — an indexing failure must never fail or mark-failed
-        # an already-successfully-completed job. Logged separately, never raised.
-        try:
+        if result.get("canceled"):
+            # User-initiated cancel (POST /jobs/{id}/cancel) — run_scrape_job
+            # noticed the DB row was flipped to 'canceled' and stopped early
+            # rather than running to completion. It already left the row as
+            # 'canceled'; no usage charge, no indexing, no "completed"
+            # notification for a job the client asked to stop.
+            log.info(f"[job {job_id[:8]}] canceled by user  [{len(_running)-1}/{MAX_GLOBAL_CONCURRENT} slots used]")
+        else:
             async with pool.acquire() as conn:
-                await index_business_job_files(conn, job_id=job["id"])
-        except Exception as idx_exc:
-            log.error(f"[job {job_id[:8]}] lead-file indexing failed (job remains completed): {idx_exc}", exc_info=True)
-
-        # ── Phase 6 hook (§19/§27): best-effort completion notification. ──
-        try:
-            async with pool.acquire() as conn:
-                await create_notification(
-                    conn, user_id=job["user_id"], category="business_updates",
-                    type="business_request_completed", title="Business Leads request completed",
-                    body=f"Your {job['industry']} / {job['state']} request is ready — {result['total_clean']} leads found.",
-                    link_section="my-leads",
+                await conn.execute(
+                    "SELECT update_usage_after_job($1,$2,$3,$4,$5,$6)",
+                    job["user_id"],
+                    result["total_clean"],
+                    result["with_website"],
+                    result["no_website"],
+                    result["emails_found"],
+                    result["with_website"],
                 )
-        except Exception as notif_exc:
-            log.error(f"[job {job_id[:8]}] completion notification failed: {notif_exc}", exc_info=True)
 
-        log.info(f"[job {job_id[:8]}] done — {result['total_clean']} leads, {result['emails_found']} emails  [{len(_running)-1}/{MAX_GLOBAL_CONCURRENT} slots used]")
+            # ── Phase 5 hook (§27): index completed outputs into lead_files. ──
+            # Isolated on purpose — an indexing failure must never fail or mark-failed
+            # an already-successfully-completed job. Logged separately, never raised.
+            try:
+                async with pool.acquire() as conn:
+                    await index_business_job_files(conn, job_id=job["id"])
+            except Exception as idx_exc:
+                log.error(f"[job {job_id[:8]}] lead-file indexing failed (job remains completed): {idx_exc}", exc_info=True)
+
+            # ── Phase 6 hook (§19/§27): best-effort completion notification. ──
+            try:
+                async with pool.acquire() as conn:
+                    await create_notification(
+                        conn, user_id=job["user_id"], category="business_updates",
+                        type="business_request_completed", title="Business Leads request completed",
+                        body=f"Your {job['industry']} / {job['state']} request is ready — {result['total_clean']} leads found.",
+                        link_section="my-leads",
+                    )
+            except Exception as notif_exc:
+                log.error(f"[job {job_id[:8]}] completion notification failed: {notif_exc}", exc_info=True)
+
+            log.info(f"[job {job_id[:8]}] done — {result['total_clean']} leads, {result['emails_found']} emails  [{len(_running)-1}/{MAX_GLOBAL_CONCURRENT} slots used]")
 
     except asyncio.CancelledError:
         # Cancelled by the watchdog because this job looked orphaned (stale

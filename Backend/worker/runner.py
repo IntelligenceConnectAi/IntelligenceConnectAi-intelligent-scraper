@@ -367,6 +367,21 @@ async def _update_city(pool: asyncpg.Pool, job_id: str, city: str, **kwargs):
         await conn.execute(sql, job_id, city, *values)
 
 
+async def _is_job_canceled(pool: asyncpg.Pool, job_id: str) -> bool:
+    """Cooperative-cancellation check. POST /jobs/{id}/cancel runs in the API
+    process, not this worker process — Railway gives them no shared memory —
+    so it can only flip the DB row, never signal a running task directly.
+    Without this, a 'canceled' job just kept scraping to completion regardless
+    (a real incident: cancel requested, emails_attempted kept climbing for
+    another 250+ sites). Each phase's per-item loop polls this before starting
+    new work, so a cancel takes effect within roughly one in-flight item's
+    timeout instead of running the whole job to the end."""
+    try:
+        return bool(await pool.fetchval("SELECT status = 'canceled' FROM jobs WHERE id = $1", job_id))
+    except Exception:
+        return False  # a DB hiccup here must never halt a legitimate job
+
+
 # ═══════════════════════════════════════════════════════════════
 #  PHASE 1 — GOOGLE MAPS SCRAPING
 # ═══════════════════════════════════════════════════════════════
@@ -561,6 +576,8 @@ async def _enrich_missing(records: list, pool: asyncpg.Pool, job_id: str) -> lis
 
         async def fetch_one(row):
             async with sem:
+                if await _is_job_canceled(pool, job_id):
+                    return
                 ctx = await browser.new_context(
                     viewport={"width": 1280, "height": 900},
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
@@ -780,6 +797,8 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
             ctx = None
             try:
                 async with semaphore:
+                    if await _is_job_canceled(pool, job_id):
+                        return
                     # Getting a working browser context can transiently fail
                     # under real resource pressure (Chrome spawn EAGAIN, or a
                     # pooled browser that just died) — this used to make
@@ -985,6 +1004,8 @@ async def run_scrape_job(
 
                     async def scrape_one_city(city):
                         async with city_sem:
+                            if await _is_job_canceled(pool, job_id):
+                                return
                             await _update_job(pool, job_id, current_city=city)
                             try:
                                 rows = await asyncio.wait_for(
@@ -1055,6 +1076,20 @@ async def run_scrape_job(
             with_web_df = await _add_emails(with_web_df, pool, job_id)
             await _update_job(pool, job_id, emails_done_at="NOW()")
 
+        # ── Cancellation guard ── a user's cancel request only ever flips the
+        # DB row (see _is_job_canceled) — check it one last time here before
+        # this function would otherwise overwrite that with status="done" and
+        # upload whatever partial results exist. The per-item checks above
+        # stop new work quickly, but this is the backstop for the case where
+        # cancellation lands after the last item already finished.
+        if await _is_job_canceled(pool, job_id):
+            log.info(f"[job {job_id[:8]}] canceled by user — stopping without uploading or marking done")
+            return {
+                "total_raw": total_raw, "total_clean": total_clean,
+                "with_website": len(with_web_df), "no_website": len(no_web_df),
+                "emails_found": 0, "canceled": True,
+            }
+
         # ── UPLOAD CSVs ──
         with_web_path = f"{user_id}/{job_id}/with_website.csv"
         no_web_path   = f"{user_id}/{job_id}/no_website.csv"
@@ -1092,4 +1127,5 @@ async def run_scrape_job(
             "with_website": len(with_web_df),
             "no_website":   len(no_web_df),
             "emails_found": emails_found,
+            "canceled":     False,
         }
