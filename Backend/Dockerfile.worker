@@ -3,9 +3,24 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
+
+# tini as PID 1 — without a real init process, orphaned/reparented Chrome
+# subprocesses (crashpad handlers, zygote helpers, etc. — common whenever a
+# browser/context is force-closed, which this worker's timeouts and watchdog
+# do constantly) never get reaped and pile up as permanent zombies. Each
+# zombie still counts against the container's cgroup pids.max, so over days
+# of real usage the count climbs until nothing new can launch — root cause
+# of the 2026-09-14 "BrowserType.launch: Target page, context or browser has
+# been closed" incident (937/941 processes were zombies; see
+# worker/PERFORMANCE_BASELINE.md). tini reaps them regardless of what the
+# Python code does.
+RUN apt-get update && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chrome
 COPY app/    ./app/
 COPY worker/ ./worker/
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "-m", "worker.main"]

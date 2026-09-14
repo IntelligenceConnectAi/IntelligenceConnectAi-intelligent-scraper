@@ -1,5 +1,52 @@
 # Worker performance baseline — revert references
 
+## 2026-09-14 incident: zombie process leak (fixed — read this first)
+
+Three jobs failed instantly with `BrowserType.launch: Target page, context or
+browser has been closed` after the worker had been running fine for 4 days
+(since the 09-10 deploy). Checked the live container:
+
+```
+pids.current = 989 / 1000        (should idle around ~50-90)
+pids.events "max" = 8523         (fork attempts denied, cumulative)
+941 total processes, 937 of them zombies
+PID 1 = `python -m worker.main` directly — no init system
+```
+
+**Root cause:** the Dockerfile ran the worker as PID 1 with no init process.
+Chrome spawns many subprocesses per browser launch (crashpad handler, zygote,
+renderer, GPU); whenever a browser/context gets force-closed — which this
+worker's per-item timeouts and watchdog cancellations do constantly — some of
+those subprocesses get orphaned and reparented to PID 1. A bare Python
+process never reaps unknown reparented children, so they sit forever as
+zombies, and **a zombie still counts against `pids.max`**. This is separate
+from the concurrency tuning below: it accumulates regardless of concurrency,
+just slower at lower concurrency, and eventually saturates the container no
+matter what the settings are.
+
+**Fix:** `Backend/Dockerfile.worker` now installs `tini` and runs it as
+`ENTRYPOINT` (PID 1), which reaps zombies regardless of what the Python code
+does — the standard fix for this well-known Docker pattern. Immediate
+mitigation was a plain restart (`railway restart` — resets pids.current to
+~50 instantly, but doesn't fix the underlying leak; it would have
+re-accumulated over the following days without the Dockerfile change).
+
+**If jobs ever start instantly-failing with the same browser-launch error
+again:** check `pids.current` / zombie count first (see commands below)
+before assuming it's a concurrency-tuning problem — this specific failure
+mode is diagnosed with `pids.current` near `pids.max` while
+`worker_heartbeats.running_jobs = 0`, i.e. saturated pids with a worker that
+thinks it's idle.
+
+```
+railway ssh ... "cat /sys/fs/cgroup/pids.current /sys/fs/cgroup/pids.max /sys/fs/cgroup/pids.events"
+railway ssh ... "ls -d /proc/[0-9]* | wc -l"                          # total processes
+railway ssh ... "grep -l 'State:.*Z' /proc/[0-9]*/status | wc -l"     # zombie count
+railway ssh ... "cat /proc/1/cmdline"                                  # confirm tini, not python, is PID 1
+```
+
+---
+
 Two tagged known-good states:
 
 | Tag | Commit | What it is |
