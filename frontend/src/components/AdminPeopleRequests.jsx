@@ -240,8 +240,9 @@ export default function AdminPeopleRequests({ hasPermission, isSuperAdmin }) {
 
   useEffect(() => { load(); }, []);
 
+  // Refetch on return to the list — see AdminBusinessRequests.jsx for why.
   if (viewingId) return (
-    <RequestDetail requestId={viewingId} onBack={() => setViewingId(null)} onChanged={load}
+    <RequestDetail requestId={viewingId} onBack={() => { setViewingId(null); load(); }} onChanged={load}
       hasPermission={hasPermission} isSuperAdmin={isSuperAdmin} />
   );
 

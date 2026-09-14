@@ -107,7 +107,11 @@ export default function AdminBusinessRequests() {
 
   useEffect(() => { load(); }, []);
 
-  if (viewingId) return <JobDetail jobId={viewingId} onBack={() => setViewingId(null)} onChanged={load} />;
+  // Refetch on return to the list — a job's status can change while its detail
+  // view is open (an admin retry, or the worker/watchdog progressing it) and the
+  // list otherwise only ever loads once on mount, so "View" then "Back" could
+  // show a stale status (e.g. still "failed" after a retry already succeeded).
+  if (viewingId) return <JobDetail jobId={viewingId} onBack={() => { setViewingId(null); load(); }} onChanged={load} />;
 
   if (loading) return (
     <div className="card p-10 text-center animate-soft-pulse">
