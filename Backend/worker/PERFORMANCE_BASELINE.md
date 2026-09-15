@@ -1,5 +1,60 @@
 # Worker performance baseline — revert references
 
+## 2026-09-15 incident: dead email browser pool never recovered (fixed — read this first)
+
+Two large jobs (Electrical/CA, 12534 with-website leads; Electrical/GA, 8658)
+each ran ~14 hours and finished "done" with a tiny fraction of the emails a
+healthy run should find (1008 and 250 — normal hit rate is ~65-76%, so these
+should have found roughly 8000-9500 and 5600-6600 respectively). Both also
+showed `emails_attempted` noticeably *higher* than `with_website`, which
+looked at first like duplicate job runs.
+
+**Root causes (two separate bugs, both in `_add_emails`'s Phase 3):**
+
+1. **No whole-pool self-healing.** `EMAIL_BROWSER_POOL_SIZE=2` browsers are
+   shared across the whole job. If both die at once (observed live:
+   `Browser.new_context: Target page, context or browser has been closed` on
+   literally every subsequent attempt, for hours), the per-item retry loop
+   only ever launches one-off replacement browsers on individual failures —
+   it never confirms the *pool* is healthy again. Once truly dead, it stayed
+   dead for the rest of the run: thousands of remaining sites each burned a
+   full 3-attempt/2s+4s-backoff retry against a permanently-broken pool,
+   finding nothing, for hours.
+2. **Double-counted failures.** The `ctx is None` (pool exhausted) branch did
+   `done[0] += 1` explicitly, but the surrounding `finally` block *also*
+   unconditionally does `done[0] += 1` on every exit path including that
+   return — every dead-pool failure was counted twice toward
+   `emails_attempted`. This, not a duplicate job execution, is what produced
+   `emails_attempted > with_website` (confirmed: the CA job's overshoot of
+   9870 matched almost exactly the count of "browser recovery failed" log
+   lines for that run).
+
+Contributing factor: both jobs got interrupted mid-run at least once by a
+worker redeploy — Railway rebuilds *all* connected services (api + worker)
+on every push to the branch, including frontend-only commits, so any code
+push during a long job's run risks orphaning it. Each interruption forced a
+full Phase 3 restart from the enrichment checkpoint (which only covers
+Phase 1+2 — Phase 3 has no per-site checkpoint), discarding whatever emails
+had already been found in that pass.
+
+**Fixes (`worker/runner.py`, `_add_emails`):**
+- Track consecutive total failures across all concurrent items; past
+  `CONSECUTIVE_FAILURE_THRESHOLD = 12`, tear down and relaunch the whole
+  pool (not just one browser) once. Cap at `MAX_POOL_RELAUNCHES = 3` — after
+  that, mark the pool `pool_dead` and skip remaining sites instantly instead
+  of burning ~18s of guaranteed-to-fail retry per site for the rest of a
+  multi-hour job. Skipped-due-to-dead-pool sites are *not* counted toward
+  `emails_attempted`, so a future incident shows up as an honest low
+  attempted count instead of a misleadingly "complete" 100%.
+- Removed the double `done[0] += 1`.
+
+**Not fixed here, flagged for follow-up:** Railway's lack of path-based
+deploy filtering means any push can orphan a long-running job. Worth
+configuring separate deploy triggers (or splitting repos) so frontend-only
+changes don't rebuild the worker.
+
+---
+
 ## 2026-09-14 incident: zombie process leak (fixed — read this first)
 
 Three jobs failed instantly with `BrowserType.launch: Target page, context or

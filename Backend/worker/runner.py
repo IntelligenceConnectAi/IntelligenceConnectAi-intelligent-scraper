@@ -812,6 +812,63 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                     browser_idx[0] += 1
                     return b
 
+            # ── Whole-pool self-healing ── a long job (many hours, thousands of
+            # sites) can outlive its browsers: if BOTH pooled browsers die at once
+            # (observed live: "Browser.new_context: Target page, context or
+            # browser has been closed" on every single subsequent attempt), the
+            # per-item retry loop below only ever launches one-off replacement
+            # browsers per failure, appended to an ever-growing list — it never
+            # actually confirms the pool is healthy again, so once truly dead it
+            # stayed dead for the rest of the run: thousands of sites each burned
+            # a full 3-attempt/2s+4s-backoff retry against a permanently-broken
+            # pool for hours, finding nothing, while still counting as "attempted"
+            # (2026-09-15 incident: two ~14h jobs each lost most of their real
+            # Phase 3 time this way, finishing with a tiny fraction of the emails
+            # a healthy run would have found). Track consecutive total failures
+            # across ALL concurrent items; past a threshold, tear down and
+            # relaunch the whole pool once instead of leaving it for dead.
+            consecutive_failures = [0]
+            pool_relaunches = [0]
+            pool_dead = [False]
+            relaunch_lock = asyncio.Lock()
+            CONSECUTIVE_FAILURE_THRESHOLD = 12
+            MAX_POOL_RELAUNCHES = 3
+
+            async def relaunch_pool():
+                async with relaunch_lock:
+                    if consecutive_failures[0] < CONSECUTIVE_FAILURE_THRESHOLD or pool_dead[0]:
+                        return  # another task already handled this batch of failures
+                    if pool_relaunches[0] >= MAX_POOL_RELAUNCHES:
+                        pool_dead[0] = True
+                        log.error(f"[job {job_id[:8]}] email browser pool unrecoverable after "
+                                  f"{pool_relaunches[0]} relaunch attempts — skipping remaining sites")
+                        return
+                    pool_relaunches[0] += 1
+                    log.warning(f"[job {job_id[:8]}] email browser pool appears dead "
+                                f"({consecutive_failures[0]} consecutive failures) — "
+                                f"relaunching (attempt {pool_relaunches[0]}/{MAX_POOL_RELAUNCHES})")
+                    async with browser_lock:
+                        dead = browsers[:]
+                        browsers.clear()
+                        for _ in range(EMAIL_BROWSER_POOL_SIZE):
+                            try:
+                                b = await p.chromium.launch(
+                                    channel="chrome", headless=True, slow_mo=0,
+                                    args=["--ignore-certificate-errors", "--ignore-ssl-errors",
+                                          "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                                )
+                                browsers.append(b)
+                            except Exception as e:
+                                log.error(f"[job {job_id[:8]}] pool relaunch: browser launch failed: {e}")
+                        browser_idx[0] = 0
+                    for b in dead:
+                        try: await b.close()
+                        except Exception: pass
+                    consecutive_failures[0] = 0
+                    if not browsers:
+                        pool_dead[0] = True
+                        log.error(f"[job {job_id[:8]}] email browser pool relaunch produced no browsers")
+
             async def process_one(row):
                 if not str(row.get("Website", "")).strip():
                     return
@@ -823,6 +880,14 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                 # user cancelled it. Checking here means a skipped item is never
                 # counted as "attempted" at all, and skips don't even wait for a slot.
                 if await _is_job_canceled(pool, job_id):
+                    return
+                # Same reasoning as the cancellation check above: once the pool is
+                # confirmed dead, skip instantly (not counted as "attempted" — an
+                # honest signal that Phase 3 didn't really run, rather than
+                # emails_attempted misleadingly reaching 100% on a pool that found
+                # nothing) instead of burning a guaranteed-to-fail 3-attempt retry
+                # (up to ~18s of backoff) on every remaining site.
+                if pool_dead[0]:
                     return
                 row["Email"] = ""
                 ctx = None
@@ -866,9 +931,18 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
 
                         if ctx is None:
                             log.error(f"[job {job_id[:8]}] browser recovery failed after retries: {last_err}")
-                            done[0] += 1
+                            consecutive_failures[0] += 1
+                            if consecutive_failures[0] >= CONSECUTIVE_FAILURE_THRESHOLD:
+                                await relaunch_pool()
+                            # (no done[0] += 1 here — the finally block below always
+                            # does it on every exit path, including this return; a
+                            # second increment here double-counted every dead-pool
+                            # failure, which is what actually produced
+                            # emails_attempted > with_website on real jobs, not a
+                            # duplicate job run as first suspected.)
                             return
 
+                        consecutive_failures[0] = 0
                         row["Email"] = await asyncio.wait_for(
                             _crawl_site_for_email(ctx, row["Website"]),
                             timeout=EMAIL_CRAWL_TIMEOUT,
