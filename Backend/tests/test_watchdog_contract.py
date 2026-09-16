@@ -20,6 +20,7 @@ STUCK_JOB_SQL = """
     FROM jobs
     WHERE status = 'running'
       AND updated_at < NOW() - make_interval(mins => $1)
+    FOR UPDATE SKIP LOCKED
 """
 STUCK_THRESHOLD_MIN = 5
 

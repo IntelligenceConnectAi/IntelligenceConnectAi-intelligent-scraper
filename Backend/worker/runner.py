@@ -367,17 +367,37 @@ async def _update_city(pool: asyncpg.Pool, job_id: str, city: str, **kwargs):
         await conn.execute(sql, job_id, city, *values)
 
 
-async def _is_job_canceled(pool: asyncpg.Pool, job_id: str) -> bool:
-    """Cooperative-cancellation check. POST /jobs/{id}/cancel runs in the API
-    process, not this worker process — Railway gives them no shared memory —
-    so it can only flip the DB row, never signal a running task directly.
-    Without this, a 'canceled' job just kept scraping to completion regardless
-    (a real incident: cancel requested, emails_attempted kept climbing for
-    another 250+ sites). Each phase's per-item loop polls this before starting
-    new work, so a cancel takes effect within roughly one in-flight item's
-    timeout instead of running the whole job to the end."""
+async def _is_job_canceled(pool: asyncpg.Pool, job_id: str, claim_token=None) -> bool:
+    """Cooperative stop-check, polled before starting each new unit of work in
+    every phase, for two independent reasons to abandon this run:
+
+    1. User-initiated cancellation. POST /jobs/{id}/cancel runs in the API
+       process, not this worker process — Railway gives them no shared memory —
+       so it can only flip the DB row, never signal a running task directly.
+       Without this, a 'canceled' job just kept scraping to completion
+       regardless (a real incident: cancel requested, emails_attempted kept
+       climbing for another 250+ sites).
+
+    2. Reclaimed by another worker replica (Step 4 — only checked when
+       claim_token is given). With multiple replicas, the watchdog on a
+       DIFFERENT replica can decide this job looks stuck and reset + re-claim
+       it — it has no way to reach into THIS replica's process to cancel the
+       original task directly, unlike the single-instance case where the
+       watchdog and the task always share one process. reset_job_to_pending()
+       clears jobs.started_at, and the next claim stamps a fresh value, so
+       comparing the job's current started_at against the value we were
+       handed at claim time detects "someone else now owns this job" even
+       across processes. claim_token=None (a non-replica-aware caller, or a
+       job started before Step 4 shipped) skips this half of the check —
+       cancellation is still honored either way.
+    """
     try:
-        return bool(await pool.fetchval("SELECT status = 'canceled' FROM jobs WHERE id = $1", job_id))
+        if claim_token is None:
+            return bool(await pool.fetchval("SELECT status = 'canceled' FROM jobs WHERE id = $1", job_id))
+        return bool(await pool.fetchval(
+            "SELECT status = 'canceled' OR started_at IS DISTINCT FROM $2 FROM jobs WHERE id = $1",
+            job_id, claim_token,
+        ))
     except Exception:
         return False  # a DB hiccup here must never halt a legitimate job
 
@@ -557,7 +577,7 @@ def _preprocess(folder_path: Path, state: str, industry: str):
 # ═══════════════════════════════════════════════════════════════
 #  PHASE 2 — DETAIL PAGE ENRICHMENT
 # ═══════════════════════════════════════════════════════════════
-async def _enrich_missing(records: list, pool: asyncpg.Pool, job_id: str) -> list:
+async def _enrich_missing(records: list, pool: asyncpg.Pool, job_id: str, claim_token=None) -> list:
     missing = [r for r in records if
                (not str(r.get("Website","")).strip() or not str(r.get("Phone","")).strip())
                and str(r.get("Maps_URL","")).strip()]
@@ -581,7 +601,7 @@ async def _enrich_missing(records: list, pool: asyncpg.Pool, job_id: str) -> lis
 
             async def fetch_one(row):
                 async with sem:
-                    if await _is_job_canceled(pool, job_id):
+                    if await _is_job_canceled(pool, job_id, claim_token):
                         return
                     ctx = await browser.new_context(
                         viewport={"width": 1280, "height": 900},
@@ -749,7 +769,7 @@ async def _crawl_site_for_email(ctx, start_url):
     return select_best_email(all_emails, start_url) if all_emails else ""
 
 
-async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.DataFrame:
+async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str, claim_token=None) -> pd.DataFrame:
     """
     Email scraping using a small BROWSER POOL shared across many contexts.
     Launch EMAIL_BROWSER_POOL_SIZE browsers once and reuse them across all
@@ -879,7 +899,7 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                 # 503/503 on a job that only genuinely tried ~40 sites before the
                 # user cancelled it. Checking here means a skipped item is never
                 # counted as "attempted" at all, and skips don't even wait for a slot.
-                if await _is_job_canceled(pool, job_id):
+                if await _is_job_canceled(pool, job_id, claim_token):
                     return
                 # Same reasoning as the cancellation check above: once the pool is
                 # confirmed dead, skip instantly (not counted as "attempted" — an
@@ -1011,6 +1031,7 @@ async def run_scrape_job(
     upload_fn,
     download_fn,
     delete_fn,
+    claim_token=None,
 ) -> dict:
     # ── Resumable checkpoints ──
     # Phase 1 (Maps) and Phase 2 (enrichment) can each take 20-60+ minutes. Previously,
@@ -1067,9 +1088,21 @@ async def run_scrape_job(
     resumed_maps   = None if resumed_enrich else await _load_checkpoint(checkpoint_maps_path)
 
     start_step = "step3_emails" if resumed_enrich else ("step2_enrich" if resumed_maps else "step1_maps")
-    await _update_job(pool, job_id,
-                      status="running", started_at="NOW()",
-                      current_step=start_step, cities_total=len(cities))
+    if claim_token is None:
+        # No fencing token supplied (a non-replica-aware caller, e.g. a test, or
+        # the pre-Step-4 single-instance path) — stamp started_at here ourselves,
+        # same as before Step 4.
+        await _update_job(pool, job_id,
+                          status="running", started_at="NOW()",
+                          current_step=start_step, cities_total=len(cities))
+    else:
+        # The poll loop's atomic claim already stamped started_at = claim_token
+        # in the same transaction that flipped this job to 'running' — re-setting
+        # it here would invalidate the very fencing token we were just handed,
+        # before this job even does any work.
+        await _update_job(pool, job_id,
+                          status="running",
+                          current_step=start_step, cities_total=len(cities))
 
     with tempfile.TemporaryDirectory() as tmpdir:
         out_dir = Path(tmpdir)
@@ -1118,7 +1151,7 @@ async def run_scrape_job(
 
                         async def scrape_one_city(city):
                             async with city_sem:
-                                if await _is_job_canceled(pool, job_id):
+                                if await _is_job_canceled(pool, job_id, claim_token):
                                     return
                                 await _update_job(pool, job_id, current_city=city)
                                 try:
@@ -1175,7 +1208,7 @@ async def run_scrape_job(
             if not no_web_df.empty or (not with_web_df.empty and with_web_df["Phone"].eq("").any()):
                 await _update_job(pool, job_id, current_step="step2_enrich")
                 all_records = pd.concat([with_web_df, no_web_df], ignore_index=True).to_dict("records")
-                all_records = await _enrich_missing(all_records, pool, job_id)
+                all_records = await _enrich_missing(all_records, pool, job_id, claim_token)
                 all_df      = pd.DataFrame(all_records)
                 with_web_df, no_web_df = _split_by_website(all_df)
                 await _update_job(pool, job_id,
@@ -1190,7 +1223,7 @@ async def run_scrape_job(
         # ── PHASE 3: Email Scraping ──
         if include_emails and not with_web_df.empty:
             await _update_job(pool, job_id, current_step="step3_emails", emails_started_at="NOW()")
-            with_web_df = await _add_emails(with_web_df, pool, job_id)
+            with_web_df = await _add_emails(with_web_df, pool, job_id, claim_token)
             await _update_job(pool, job_id, emails_done_at="NOW()")
 
         # ── Cancellation guard ── a user's cancel request only ever flips the
@@ -1199,8 +1232,8 @@ async def run_scrape_job(
         # upload whatever partial results exist. The per-item checks above
         # stop new work quickly, but this is the backstop for the case where
         # cancellation lands after the last item already finished.
-        if await _is_job_canceled(pool, job_id):
-            log.info(f"[job {job_id[:8]}] canceled by user — stopping without uploading or marking done")
+        if await _is_job_canceled(pool, job_id, claim_token):
+            log.info(f"[job {job_id[:8]}] canceled or reclaimed by another replica — stopping without uploading or marking done")
             return {
                 "total_raw": total_raw, "total_clean": total_clean,
                 "with_website": len(with_web_df), "no_website": len(no_web_df),

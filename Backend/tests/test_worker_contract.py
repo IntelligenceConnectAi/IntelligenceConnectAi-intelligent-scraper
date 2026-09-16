@@ -29,6 +29,7 @@ WORKER_POLL_SQL = """
     WHERE j.status = 'pending'
     ORDER BY j.created_at ASC
     LIMIT $1
+    FOR UPDATE OF j SKIP LOCKED
 """
 
 

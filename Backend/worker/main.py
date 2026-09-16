@@ -2,12 +2,36 @@
 Intelligent Scraper — Background Worker
 Polls the jobs table every 3 seconds for pending jobs.
 
-Global limit: MAX_GLOBAL_CONCURRENT = 10
-  - Max 10 jobs running at the same time across ALL users (raised from 2 —
-    sized for a single beefier instance, e.g. Railway Pro's 24 vCPU/24GB
-    replica tier; still one process, no horizontal-replica support)
-  - 11th user waits in queue
-  - As soon as any running job finishes, next pending job starts automatically
+Global limit: MAX_GLOBAL_CONCURRENT = 2
+  - Max 2 jobs running at the same time PER REPLICA of this service (pulled
+    down from an earlier 10 after real production incidents — see the
+    constant's own comment below for the full story). Total cluster-wide
+    capacity is this × however many replicas Railway is running.
+  - The next pending job past that per-replica limit waits in queue, picked up
+    by whichever replica (this one or another) next has a free slot.
+  - As soon as any running job finishes, the next pending job starts automatically.
+
+Step 4 — horizontal replicas:
+  - Job claiming uses `SELECT ... FOR UPDATE SKIP LOCKED` (see _poll_loop) so
+    multiple replicas can poll concurrently without ever grabbing the same
+    job — a second replica's query simply never sees a row this one already
+    has locked, instead of racing to claim it too. The status flip to
+    'running' happens in the same transaction as the claim.
+  - Each replica has its own heartbeat identity (HEARTBEAT_WORKER_ID, derived
+    from Railway's RAILWAY_REPLICA_ID) instead of one shared row, so a
+    specific replica dying is visible instead of being masked by others'
+    heartbeats overwriting it.
+  - The watchdog also claims stuck jobs with FOR UPDATE SKIP LOCKED, so with N
+    replicas all running their own watchdog loop, only one of them actually
+    resets a given stuck row — no leader election needed, every replica is
+    equally capable of watchdog duty.
+  - A replica can only task.cancel() a job it is itself tracking in-process —
+    it has no way to reach into another replica's process. The ownership-
+    fencing check in runner.py's _is_job_canceled (via claim_token) is what
+    makes a reset from a DIFFERENT replica's watchdog actually stop the
+    original task: reset_job_to_pending() clears started_at, the next claim
+    stamps a fresh value, and the original task's per-item checks notice the
+    mismatch and abandon their work on their own.
 
 Resilience (worker_heartbeats table, jobs.retry_count):
   - The poll loop writes a heartbeat every cycle; 3 consecutive DB failures trigger
@@ -24,6 +48,7 @@ Resilience (worker_heartbeats table, jobs.retry_count):
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -81,7 +106,15 @@ STUCK_THRESHOLD_MIN = 10       # was 5 — Phase 3's EMAIL_CRAWL_TIMEOUT is 240s
                                 # Phase 1 is separately time-bounded (runner.py)
 MAX_AUTO_RETRIES = 2
 POOL_FAILURE_THRESHOLD = 3     # consecutive heartbeat failures before pool recreation
-HEARTBEAT_WORKER_ID = "primary"
+
+# Step 4 (horizontal replicas): was a hardcoded "primary" — every replica would
+# have overwritten the same worker_heartbeats row every 3s, making it impossible
+# to tell replicas apart or notice one specific replica dying while others stay
+# healthy. RAILWAY_REPLICA_ID is a real Railway-provided env var, unique per
+# replica; "local" is the fallback for local dev / a single non-replicated
+# instance, where there's only ever one row anyway.
+REPLICA_ID = os.environ.get("RAILWAY_REPLICA_ID", "local")
+HEARTBEAT_WORKER_ID = REPLICA_ID
 
 # job_id → user_id for currently running jobs
 _running: dict[str, str] = {}
@@ -146,10 +179,10 @@ async def _delete(storage_path: str) -> None:
     await delete_object(storage_path)
 
 
-async def _process_job(job: dict, pool: asyncpg.Pool) -> None:
+async def _process_job(job: dict, pool: asyncpg.Pool, claim_token) -> None:
     job_id  = str(job["id"])
     user_id = str(job["user_id"])
-    log.info(f"[job {job_id[:8]}] starting  [{job['industry']} / {job['state']} / {len(job['cities'])} cities]  [{len(_running)}/{MAX_GLOBAL_CONCURRENT} slots used]")
+    log.info(f"[job {job_id[:8]}] starting  [{job['industry']} / {job['state']} / {len(job['cities'])} cities]  [{len(_running)}/{MAX_GLOBAL_CONCURRENT} slots used, replica {REPLICA_ID}]")
 
     try:
         result = await run_scrape_job(
@@ -163,15 +196,18 @@ async def _process_job(job: dict, pool: asyncpg.Pool) -> None:
             upload_fn      = _upload,
             download_fn    = _download,
             delete_fn      = _delete,
+            claim_token    = claim_token,
         )
 
         if result.get("canceled"):
-            # User-initiated cancel (POST /jobs/{id}/cancel) — run_scrape_job
-            # noticed the DB row was flipped to 'canceled' and stopped early
-            # rather than running to completion. It already left the row as
-            # 'canceled'; no usage charge, no indexing, no "completed"
-            # notification for a job the client asked to stop.
-            log.info(f"[job {job_id[:8]}] canceled by user  [{len(_running)-1}/{MAX_GLOBAL_CONCURRENT} slots used]")
+            # Either a user-initiated cancel (POST /jobs/{id}/cancel), or — with
+            # Step 4's multiple replicas — this replica's task was reclaimed by
+            # another replica's watchdog partway through and cooperatively
+            # stopped once it noticed (see runner.py's _is_job_canceled). Either
+            # way run_scrape_job already left the row in the correct state; no
+            # usage charge, no indexing, no "completed" notification from this
+            # (possibly stale) execution.
+            log.info(f"[job {job_id[:8]}] canceled or reclaimed  [{len(_running)-1}/{MAX_GLOBAL_CONCURRENT} slots used]")
         else:
             async with pool.acquire() as conn:
                 await conn.execute(
@@ -216,21 +252,34 @@ async def _process_job(job: dict, pool: asyncpg.Pool) -> None:
 
     except Exception as exc:
         log.error(f"[job {job_id[:8]}] failed: {exc}", exc_info=True)
+        # Step 4 fencing: if another replica's watchdog already reclaimed this
+        # job (reset_job_to_pending clears started_at, the new claim stamps a
+        # fresh value), this task's own error is stale — the row now belongs to
+        # a fresh attempt, and writing 'failed' here would stomp on it. Skip the
+        # destructive write (and the failure notification) unless we still own it.
         async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE jobs SET status='failed', error_message=$2, updated_at=NOW() WHERE id=$1",
-                job["id"], str(exc)[:500],
+            still_ours = claim_token is None or await conn.fetchval(
+                "SELECT started_at = $2 FROM jobs WHERE id = $1", job["id"], claim_token,
             )
-        try:
-            async with pool.acquire() as conn:
-                await create_notification(
-                    conn, user_id=job["user_id"], category="business_updates",
-                    type="business_request_failed", title="Business Leads request failed",
-                    body=f"Your {job['industry']} / {job['state']} request could not be completed. Please try again or contact support.",
-                    link_section="get-leads", link_sub_tab="business",
+            if still_ours:
+                await conn.execute(
+                    "UPDATE jobs SET status='failed', error_message=$2, updated_at=NOW() WHERE id=$1",
+                    job["id"], str(exc)[:500],
                 )
-        except Exception as notif_exc:
-            log.error(f"[job {job_id[:8]}] failure notification failed: {notif_exc}", exc_info=True)
+            else:
+                log.warning(f"[job {job_id[:8]}] error occurred after this task was reclaimed by "
+                            f"another replica — leaving the job row alone")
+        if still_ours:
+            try:
+                async with pool.acquire() as conn:
+                    await create_notification(
+                        conn, user_id=job["user_id"], category="business_updates",
+                        type="business_request_failed", title="Business Leads request failed",
+                        body=f"Your {job['industry']} / {job['state']} request could not be completed. Please try again or contact support.",
+                        link_section="get-leads", link_sub_tab="business",
+                    )
+            except Exception as notif_exc:
+                log.error(f"[job {job_id[:8]}] failure notification failed: {notif_exc}", exc_info=True)
 
     finally:
         _running.pop(job_id, None)
@@ -269,7 +318,7 @@ async def _write_heartbeat(holder: PoolHolder) -> None:
 
 
 async def _poll_loop(holder: PoolHolder) -> None:
-    log.info(f"Worker polling every 3 seconds — global limit: {MAX_GLOBAL_CONCURRENT} concurrent jobs")
+    log.info(f"Worker polling every 3 seconds — global limit: {MAX_GLOBAL_CONCURRENT} concurrent jobs per replica (replica {REPLICA_ID})")
 
     while not _shutdown:
         await _write_heartbeat(holder)
@@ -278,36 +327,62 @@ async def _poll_loop(holder: PoolHolder) -> None:
             # How many slots are free?
             free_slots = MAX_GLOBAL_CONCURRENT - len(_running)
 
+            candidates: list = []
+            claim_tokens: dict = {}
+
             if free_slots > 0:
-                rows = await holder.pool.fetch(
-                    """
-                    SELECT
-                        j.id, j.user_id, j.industry, j.state, j.cities,
-                        p.email_scraping AS plan_email_scraping
-                    FROM jobs j
-                    JOIN subscriptions s ON s.user_id = j.user_id AND s.status = 'active'
-                    JOIN plans p         ON p.id = s.plan_id
-                    WHERE j.status = 'pending'
-                    ORDER BY j.created_at ASC
-                    LIMIT $1
-                    """,
-                    free_slots,
-                )
+                # Step 4: claim atomically. FOR UPDATE SKIP LOCKED lets multiple
+                # replicas poll concurrently without ever grabbing the same job —
+                # a second replica's SELECT simply never sees a row this one
+                # already has locked, instead of racing to claim it too. The
+                # status flip to 'running' happens in the same transaction as
+                # the lock, before it's released, closing the window a plain
+                # SELECT-then-UPDATE would leave open for a second replica to
+                # see the row as still 'pending'.
+                async with holder.pool.acquire() as conn:
+                    async with conn.transaction():
+                        candidates = await conn.fetch(
+                            """
+                            SELECT
+                                j.id, j.user_id, j.industry, j.state, j.cities,
+                                p.email_scraping AS plan_email_scraping
+                            FROM jobs j
+                            JOIN subscriptions s ON s.user_id = j.user_id AND s.status = 'active'
+                            JOIN plans p         ON p.id = s.plan_id
+                            WHERE j.status = 'pending'
+                            ORDER BY j.created_at ASC
+                            LIMIT $1
+                            FOR UPDATE OF j SKIP LOCKED
+                            """,
+                            free_slots,
+                        )
+                        if candidates:
+                            claim_rows = await conn.fetch(
+                                """
+                                UPDATE jobs SET status = 'running', started_at = NOW(), updated_at = NOW()
+                                WHERE id = ANY($1::uuid[])
+                                RETURNING id, started_at
+                                """,
+                                [c["id"] for c in candidates],
+                            )
+                            # started_at, captured here, becomes this job's fencing
+                            # token — see runner.py's _is_job_canceled for why.
+                            claim_tokens = {str(r["id"]): r["started_at"] for r in claim_rows}
 
-                for job in rows:
-                    job_id = str(job["id"])
+            for job in candidates:
+                job_id = str(job["id"])
 
-                    if job_id in _running:
-                        continue
+                if job_id in _running:
+                    continue
 
-                    # Still within global limit?
-                    if len(_running) >= MAX_GLOBAL_CONCURRENT:
-                        break
+                # Still within global limit?
+                if len(_running) >= MAX_GLOBAL_CONCURRENT:
+                    break
 
-                    _running[job_id] = str(job["user_id"])
-                    task = asyncio.create_task(_process_job(dict(job), holder.pool))
-                    _running_tasks[job_id] = task
-                    log.info(f"[job {job_id[:8]}] queued — {len(_running)}/{MAX_GLOBAL_CONCURRENT} slots now used")
+                _running[job_id] = str(job["user_id"])
+                task = asyncio.create_task(_process_job(dict(job), holder.pool, claim_tokens[job_id]))
+                _running_tasks[job_id] = task
+                log.info(f"[job {job_id[:8]}] queued — {len(_running)}/{MAX_GLOBAL_CONCURRENT} slots now used (replica {REPLICA_ID})")
 
         except Exception as e:
             log.error(f"Poll loop error: {e}", exc_info=True)
@@ -324,66 +399,85 @@ async def _watchdog_loop(holder: PoolHolder) -> None:
     or mark permanently failed with a real client notification.
     Handles power cuts, network drops, OOM crashes, and DB outages that orphan
     a job mid-run — all without any human needing to notice or act.
+
+    Step 4: every replica runs this same loop independently. The stuck-job
+    query below uses FOR UPDATE SKIP LOCKED so if two replicas' watchdogs fire
+    at nearly the same moment and both see the same stale row, only one of
+    them actually locks and processes it — the other's query simply doesn't
+    see it, no leader election needed. task.cancel() below can only ever stop
+    a task THIS replica is tracking; if the stuck job actually belongs to a
+    different (possibly still-alive, just slow) replica, this watchdog can't
+    reach it directly — but reset_job_to_pending()'s started_at bump acts as a
+    fencing token that job's real owner will notice on its own next per-item
+    check (see runner.py's _is_job_canceled) and stop cooperatively.
     """
-    log.info(f"Watchdog started — checks every {WATCHDOG_INTERVAL_S}s for jobs stuck >{STUCK_THRESHOLD_MIN}min")
+    log.info(f"Watchdog started — checks every {WATCHDOG_INTERVAL_S}s for jobs stuck >{STUCK_THRESHOLD_MIN}min (replica {REPLICA_ID})")
     while not _shutdown:
         await asyncio.sleep(WATCHDOG_INTERVAL_S)
         try:
-            stuck = await holder.pool.fetch(
-                """
-                SELECT id, user_id, industry, state, retry_count
-                FROM jobs
-                WHERE status = 'running'
-                  AND updated_at < NOW() - make_interval(mins => $1)
-                """,
-                STUCK_THRESHOLD_MIN,
-            )
-            for row in stuck:
-                job_id = str(row["id"])
+            async with holder.pool.acquire() as conn:
+                async with conn.transaction():
+                    stuck = await conn.fetch(
+                        """
+                        SELECT id, user_id, industry, state, retry_count
+                        FROM jobs
+                        WHERE status = 'running'
+                          AND updated_at < NOW() - make_interval(mins => $1)
+                        FOR UPDATE SKIP LOCKED
+                        """,
+                        STUCK_THRESHOLD_MIN,
+                    )
+                    for row in stuck:
+                        job_id = str(row["id"])
 
-                task = _running_tasks.get(job_id)
-                if task and not task.done():
-                    task.cancel()
-                    log.warning(f"[job {job_id[:8]}] watchdog cancelled in-process hung task")
-                _running.pop(job_id, None)
-                _running_tasks.pop(job_id, None)
+                        task = _running_tasks.get(job_id)
+                        if task and not task.done():
+                            task.cancel()
+                            log.warning(f"[job {job_id[:8]}] watchdog cancelled in-process hung task")
+                        _running.pop(job_id, None)
+                        _running_tasks.pop(job_id, None)
 
-                async with holder.pool.acquire() as conn:
-                    if row["retry_count"] < MAX_AUTO_RETRIES:
-                        async with conn.transaction():
+                        if row["retry_count"] < MAX_AUTO_RETRIES:
                             await reset_job_to_pending(conn, row["id"], bump_retry_count=True)
-                        log.warning(
-                            f"[job {job_id[:8]}] watchdog auto-requeued "
-                            f"[{row['industry']} / {row['state']}] (attempt {row['retry_count'] + 1}/{MAX_AUTO_RETRIES})"
-                        )
-                    else:
-                        await conn.execute(
-                            "UPDATE jobs SET status='failed', error_message=$2, updated_at=NOW() WHERE id=$1",
-                            row["id"],
-                            f"Job stalled and could not be automatically recovered after {MAX_AUTO_RETRIES} attempts. Please try again or contact support.",
-                        )
-                        try:
-                            await create_notification(
-                                conn, user_id=row["user_id"], category="business_updates",
-                                type="business_request_failed", title="Business Leads request failed",
-                                body=f"Your {row['industry']} / {row['state']} request could not be completed. Please try again or contact support.",
-                                link_section="get-leads", link_sub_tab="business",
+                            log.warning(
+                                f"[job {job_id[:8]}] watchdog auto-requeued "
+                                f"[{row['industry']} / {row['state']}] (attempt {row['retry_count'] + 1}/{MAX_AUTO_RETRIES}, replica {REPLICA_ID})"
                             )
-                        except Exception as notif_exc:
-                            log.error(f"[job {job_id[:8]}] failure notification failed: {notif_exc}", exc_info=True)
-                        log.warning(f"[job {job_id[:8]}] watchdog permanently failed [{row['industry']} / {row['state']}] — auto-retry budget exhausted")
+                        else:
+                            await conn.execute(
+                                "UPDATE jobs SET status='failed', error_message=$2, updated_at=NOW() WHERE id=$1",
+                                row["id"],
+                                f"Job stalled and could not be automatically recovered after {MAX_AUTO_RETRIES} attempts. Please try again or contact support.",
+                            )
+                            try:
+                                await create_notification(
+                                    conn, user_id=row["user_id"], category="business_updates",
+                                    type="business_request_failed", title="Business Leads request failed",
+                                    body=f"Your {row['industry']} / {row['state']} request could not be completed. Please try again or contact support.",
+                                    link_section="get-leads", link_sub_tab="business",
+                                )
+                            except Exception as notif_exc:
+                                log.error(f"[job {job_id[:8]}] failure notification failed: {notif_exc}", exc_info=True)
+                            log.warning(f"[job {job_id[:8]}] watchdog permanently failed [{row['industry']} / {row['state']}] — auto-retry budget exhausted")
         except Exception as e:
             log.error(f"Watchdog error: {e}", exc_info=True)
 
 
 async def main() -> None:
-    log.info("Intelligent Scraper Worker starting…")
-    log.info(f"Global concurrent job limit: {MAX_GLOBAL_CONCURRENT}")
+    log.info(f"Intelligent Scraper Worker starting… (replica {REPLICA_ID})")
+    log.info(f"Global concurrent job limit: {MAX_GLOBAL_CONCURRENT} per replica")
 
     pool = await asyncpg.create_pool(
         settings.database_url,
-        # Must match PoolHolder.recreate()'s sizing above — see the comment there
-        # for why this is capped well under Supabase's 15-connection pooler limit.
+        # Must match PoolHolder.recreate()'s sizing above.
+        # Step 4 (horizontal replicas): this budget is PER REPLICA, and every
+        # replica plus the API service share Supabase's pooler connection cap.
+        # Before running more than 1 replica, confirm the pooler's pool_size
+        # setting (Database Settings, currently 15 on our project — see
+        # PERFORMANCE_BASELINE.md) has been raised to comfortably fit
+        # N x max_size (this) + the API's own max_size — e.g. 3 replicas x 8
+        # + API's 5 = 29, which needs pool_size raised well past today's 15
+        # even though the underlying free-tier hard cap is 60.
         min_size=3,
         max_size=8,
         command_timeout=60,

@@ -1,5 +1,58 @@
 # Worker performance baseline — revert references
 
+## Step 4: horizontal replicas (local — not yet deployed)
+
+Code is done locally (not pushed/deployed yet — pending confirmation).
+Revert target if it proves unstable: `worker-stable-pre-step4` (tag), which is
+the last known-good single-instance state, identical in behavior to
+`worker-stable-step2` plus everything fixed since (browser-leak-on-cancel,
+DB pool sizing, email-pool self-healing).
+
+**What changed (`worker/main.py`, `worker/runner.py`):**
+- Job claiming (`_poll_loop`) now uses `SELECT ... FOR UPDATE SKIP LOCKED`
+  then an `UPDATE ... RETURNING started_at` in the same transaction, so
+  multiple replicas can poll concurrently without ever double-claiming a job.
+  The returned `started_at` becomes that job's "claim token."
+- `_watchdog_loop`'s stuck-job query does the same `FOR UPDATE SKIP LOCKED` —
+  with N replicas each running their own watchdog, only one ever actually
+  resets a given stuck row. No leader election needed.
+- `HEARTBEAT_WORKER_ID` is now `RAILWAY_REPLICA_ID` (falls back to `"local"`)
+  instead of the old hardcoded `"primary"` — each replica gets its own
+  `worker_heartbeats` row instead of all of them overwriting one shared row.
+- **Ownership fencing** (`runner.py`'s `_is_job_canceled`, now also takes
+  `claim_token`): a replica's watchdog can only `task.cancel()` a task it is
+  itself tracking — it has no way to reach into another replica's process. If
+  replica B's watchdog resets a job that's actually still alive and running
+  on replica A (a false-positive stuck read, or A genuinely dead), A's task
+  needs its own way to notice. `reset_job_to_pending()` clears
+  `jobs.started_at`; the next claim (by whichever replica) stamps a fresh
+  value. Every per-item check across all 3 phases, plus the final backstop,
+  now also compares the job's current `started_at` against the `claim_token`
+  it was handed at claim time — a mismatch means "someone else owns this job
+  now," and the stale task stops cooperatively, same code path as user
+  cancellation. `main.py`'s generic failure handler in `_process_job` also
+  checks this before writing `status='failed'`, so a stale task's own
+  unrelated error can't stomp on a fresh attempt's row either.
+- `MAX_GLOBAL_CONCURRENT` stays a **per-replica** cap (unchanged at 2) — total
+  cluster capacity is this × replica count. No cross-replica coordination for
+  concurrency itself, only for claiming/ownership.
+
+**Prerequisite before deploying more than 1 replica — not yet done:**
+Supabase's session pooler `pool_size` is currently 15 (Database Settings),
+shared between every replica's worker pool (`min=3/max=8` each) and the API's
+(`min=2/max=5`). N replicas need `N × 8 + 5` connections at peak. This must be
+raised (the underlying free-tier hard cap is 60 total DB connections, so
+there's real room — see the 2026-09-17 planning conversation) before scaling
+past 1 replica, or it reproduces the 2026-09-14 EMAXCONNSESSION outage.
+
+**Also not addressed by this step:** Railway rebuilds every connected service
+on any push, including frontend-only ones (confirmed 2026-09-14/15) — with
+more replicas running more concurrent jobs, a routine push now risks
+interrupting more jobs at once, not fewer. Worth pairing path-based deploy
+triggers with this before running many replicas in practice.
+
+---
+
 ## 2026-09-15 incident: dead email browser pool never recovered (fixed — read this first)
 
 Two large jobs (Electrical/CA, 12534 with-website leads; Electrical/GA, 8658)
