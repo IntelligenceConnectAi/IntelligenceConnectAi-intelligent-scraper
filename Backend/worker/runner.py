@@ -519,7 +519,9 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
         await _update_city(pool, job_id, city, maps_status="failed", error=str(e)[:200])
         return []
     finally:
-        await context.close()
+        try: await context.close()
+        except asyncio.CancelledError: raise
+        except Exception: pass
 
     await _update_city(pool, job_id, city, maps_status="done",
                        maps_leads=len(results), maps_done_at="NOW()")
@@ -1136,6 +1138,7 @@ async def run_scrape_job(
                 # closes its own context, so no extra cleanup needed here.
                 async with async_playwright() as p:
                     browser = await p.chromium.launch(channel="chrome", headless=True, slow_mo=0)
+                    browser_ref = [browser]  # mutable — relaunch_browser() below swaps this out
                     # try/finally guarantees browser.close() runs even if this is
                     # cancelled externally (watchdog rescuing a stuck job) —
                     # without it, cancellation skips straight past the close()
@@ -1149,26 +1152,85 @@ async def run_scrape_job(
                         raw_total  = [0]
                         done_total = [0]
 
+                        # ── Whole-browser self-healing ── Phase 1 shares ONE
+                        # browser across every city (unlike Phase 3's pool). If it
+                        # dies mid-job — observed live: "Target page, context or
+                        # browser has been closed" cascading across dozens of
+                        # cities within seconds — every remaining city failed
+                        # instantly, but since each per-city failure is caught
+                        # individually, the job still "completed" with 100% cities
+                        # done and zero real leads (2026-09-18 incident). Track
+                        # consecutive city failures; past a threshold, relaunch the
+                        # browser. If it still won't recover after a few tries,
+                        # fail the job loudly instead of completing with
+                        # fabricated-looking empty results — unlike Phase 3, there
+                        # is no earlier-phase data worth salvaging from a dead
+                        # Phase 1.
+                        consecutive_failures = [0]
+                        browser_relaunches   = [0]
+                        phase1_dead          = [False]
+                        relaunch_lock = asyncio.Lock()
+                        CONSECUTIVE_FAILURE_THRESHOLD = 8
+                        MAX_BROWSER_RELAUNCHES = 3
+
+                        async def relaunch_browser():
+                            async with relaunch_lock:
+                                if consecutive_failures[0] < CONSECUTIVE_FAILURE_THRESHOLD or phase1_dead[0]:
+                                    return  # another concurrent city already handled this batch
+                                if browser_relaunches[0] >= MAX_BROWSER_RELAUNCHES:
+                                    phase1_dead[0] = True
+                                    log.error(f"[job {job_id[:8]}] Phase 1 browser unrecoverable after "
+                                              f"{browser_relaunches[0]} relaunch attempts — stopping Maps scrape")
+                                    return
+                                browser_relaunches[0] += 1
+                                log.warning(f"[job {job_id[:8]}] Phase 1 browser appears dead "
+                                            f"({consecutive_failures[0]} consecutive city failures) — "
+                                            f"relaunching (attempt {browser_relaunches[0]}/{MAX_BROWSER_RELAUNCHES})")
+                                old = browser_ref[0]
+                                try:
+                                    browser_ref[0] = await p.chromium.launch(channel="chrome", headless=True, slow_mo=0)
+                                except Exception as e:
+                                    log.error(f"[job {job_id[:8]}] Phase 1 browser relaunch failed: {e}")
+                                    return
+                                try:
+                                    await old.close()
+                                except Exception:
+                                    pass
+                                consecutive_failures[0] = 0
+
                         async def scrape_one_city(city):
                             async with city_sem:
                                 if await _is_job_canceled(pool, job_id, claim_token):
                                     return
+                                # Same reasoning as Phase 3's pool_dead skip: once
+                                # the browser is confirmed unrecoverable, skip
+                                # instantly rather than trying and failing again,
+                                # and don't count this city as attempted.
+                                if phase1_dead[0]:
+                                    return
                                 await _update_job(pool, job_id, current_city=city)
                                 try:
                                     rows = await asyncio.wait_for(
-                                        _scrape_city(city, state, industry, browser, out_dir, pool, job_id),
+                                        _scrape_city(city, state, industry, browser_ref[0], out_dir, pool, job_id),
                                         timeout=CITY_SCRAPE_TIMEOUT_S,
                                     )
+                                    consecutive_failures[0] = 0
                                 except asyncio.CancelledError:
                                     raise
                                 except asyncio.TimeoutError:
                                     log.error(f"[job {job_id[:8]}] {city} scrape timed out after {CITY_SCRAPE_TIMEOUT_S}s")
                                     await _update_city(pool, job_id, city, maps_status="failed", error="City scrape timed out")
                                     rows = []
+                                    consecutive_failures[0] += 1
                                 except Exception as e:
                                     log.error(f"[job {job_id[:8]}] unexpected error scraping {city}: {e}")
                                     await _update_city(pool, job_id, city, maps_status="failed", error=str(e)[:200])
                                     rows = []
+                                    consecutive_failures[0] += 1
+
+                                if consecutive_failures[0] >= CONSECUTIVE_FAILURE_THRESHOLD:
+                                    await relaunch_browser()
+
                                 # Update progress on every completion (not batched) —
                                 # same reasoning as Phase 2/3: with several cities
                                 # in flight at once, batching would let the watchdog
@@ -1179,9 +1241,14 @@ async def run_scrape_job(
 
                         await asyncio.gather(*[scrape_one_city(city) for city in cities],
                                             return_exceptions=True)
+                        if phase1_dead[0]:
+                            raise RuntimeError(
+                                f"Phase 1 (Google Maps) browser became unrecoverable after "
+                                f"{MAX_BROWSER_RELAUNCHES} relaunch attempts"
+                            )
                         total_raw = raw_total[0]
                     finally:
-                        try: await browser.close()
+                        try: await browser_ref[0].close()
                         except asyncio.CancelledError: raise
                         except Exception: pass
 

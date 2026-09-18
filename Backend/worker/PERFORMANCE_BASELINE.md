@@ -1,6 +1,59 @@
 # Worker performance baseline — revert references
 
-## Step 4: horizontal replicas (local — not yet deployed)
+## 2026-09-18 incident: Phase 1 browser death + zero-retry hard failures (fixed — local, not yet deployed)
+
+Live-tested Step 4 at 3 replicas / 15 real jobs. Result: 6 jobs permanently
+failed and 1 "completed" with 100% cities done but zero real leads — all
+traced to one ~38-second window where a single replica (`d9bc375c`) cycled
+through 7 jobs on its 2 slots in rapid succession, every one hitting
+`Target page, context or browser has been closed`. Not a double-claim, not a
+deploy/restart, not a connection-pool issue — confirmed no deployment
+happened near that time and every job was claimed exactly once. Self-resolved
+after ~38s; the same replica ran jobs normally before and after.
+
+This exposed two real, separate gaps:
+
+1. **Phase 1 had no self-healing.** Unlike Phase 3 (fixed 2026-09-15), Phase
+   1 shares one browser across every city with no recovery path — when it
+   died mid-job, every remaining city failed instantly (caught individually),
+   so the job still "completed" as `done` with 100% cities and zero leads
+   (job `3afdd4f5`, Plumbing/NY — 82 cities' worth of identical
+   `Browser.new_context` failures inside 2 seconds).
+2. **A hard failure (uncaught exception) got zero automatic retries.** The 6
+   failed jobs all show `retry_count: 0` — they never touched the watchdog's
+   `MAX_AUTO_RETRIES` budget at all, since that only fires for *stale* jobs,
+   not ones that fail immediately with an exception.
+
+**Fixes (`worker/runner.py`, `worker/main.py`):**
+- Phase 1 now tracks consecutive city failures; past `CONSECUTIVE_FAILURE_THRESHOLD
+  = 8`, relaunches its single browser (capped at `MAX_BROWSER_RELAUNCHES = 3`).
+  If still dead after that, raises a real error instead of silently
+  completing — there's no earlier-phase data worth salvaging from a dead
+  Phase 1, unlike Phase 3, so failing loudly (and now retrying, per the next
+  fix) is the correct behavior, not completing with fabricated-looking empty
+  results.
+- `_process_job`'s generic exception handler now shares the watchdog's
+  `MAX_AUTO_RETRIES` budget (same `retry_count` column, so a job can't
+  accumulate separate budgets per failure mode) instead of marking `failed`
+  on the first hard exception. Only sends the failure notification once
+  retries are genuinely exhausted — same as the watchdog already does.
+- Also hardened `_scrape_city`'s `finally: context.close()` (was a bare
+  unguarded call) to the same `except asyncio.CancelledError: raise / except
+  Exception: pass` pattern used everywhere else in this file.
+
+**Not yet explained, flagged for follow-up, no fix proposed:** job
+`41b1568b` (Electricians/OH) attempted its full 8,495 with-website count but
+found only 82 emails (~1%, vs the normal 30-65%) — contexts were being
+created successfully (not the dead-pool pattern), so something else degraded
+actual page scraping for that run specifically. Needs its own investigation
+before proposing anything.
+
+Revert target: `worker-stable-step4` (tag) — Step 4 deployed and
+live-verified at 3 replicas, before these two fixes.
+
+---
+
+## Step 4: horizontal replicas (deployed and live-verified at 3 replicas)
 
 Code is done locally (not pushed/deployed yet — pending confirmation).
 Revert target if it proves unstable: `worker-stable-pre-step4` (tag), which is

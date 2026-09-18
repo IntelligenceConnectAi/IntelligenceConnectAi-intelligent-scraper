@@ -257,19 +257,39 @@ async def _process_job(job: dict, pool: asyncpg.Pool, claim_token) -> None:
         # fresh value), this task's own error is stale — the row now belongs to
         # a fresh attempt, and writing 'failed' here would stomp on it. Skip the
         # destructive write (and the failure notification) unless we still own it.
+        permanently_failed = False
         async with pool.acquire() as conn:
             still_ours = claim_token is None or await conn.fetchval(
                 "SELECT started_at = $2 FROM jobs WHERE id = $1", job["id"], claim_token,
             )
             if still_ours:
-                await conn.execute(
-                    "UPDATE jobs SET status='failed', error_message=$2, updated_at=NOW() WHERE id=$1",
-                    job["id"], str(exc)[:500],
+                # A hard failure used to go straight to permanently 'failed' with
+                # zero retries, completely bypassing the watchdog's
+                # MAX_AUTO_RETRIES budget — that only ever triggers for jobs that
+                # go stale, not ones that fail immediately (2026-09-18 incident: a
+                # ~38s burst of one replica's browsers failing to launch
+                # permanently failed 6 jobs on their very first attempt). Give a
+                # hard failure the same retry budget a stuck job already gets,
+                # sharing the same retry_count column so a job can't accumulate
+                # separate budgets per failure mode.
+                current_retry_count = await conn.fetchval(
+                    "SELECT retry_count FROM jobs WHERE id = $1", job["id"]
                 )
+                if current_retry_count < MAX_AUTO_RETRIES:
+                    async with conn.transaction():
+                        await reset_job_to_pending(conn, job["id"], bump_retry_count=True)
+                    log.warning(f"[job {job_id[:8]}] hard failure — auto-requeued "
+                                f"(attempt {current_retry_count + 1}/{MAX_AUTO_RETRIES}): {exc}")
+                else:
+                    permanently_failed = True
+                    await conn.execute(
+                        "UPDATE jobs SET status='failed', error_message=$2, updated_at=NOW() WHERE id=$1",
+                        job["id"], str(exc)[:500],
+                    )
             else:
                 log.warning(f"[job {job_id[:8]}] error occurred after this task was reclaimed by "
                             f"another replica — leaving the job row alone")
-        if still_ours:
+        if permanently_failed:
             try:
                 async with pool.acquire() as conn:
                     await create_notification(
