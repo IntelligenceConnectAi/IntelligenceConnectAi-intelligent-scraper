@@ -1,6 +1,61 @@
 # Worker performance baseline — revert references
 
-## 2026-09-18 incident: Phase 1 browser death + zero-retry hard failures (fixed — local, not yet deployed)
+## 2026-09-18 incident #2: one replica stuck for 26+ min, retries kept re-hitting it (fixed — local, not yet deployed)
+
+Deployed the Phase 1 self-healing + retry-on-hard-failure fix below, then
+live-tested it by resubmitting a real 15-job batch. Both fixes worked exactly
+as designed — 4 jobs correctly failed loudly (`"Phase 1 ... unrecoverable
+after 3 relaunch attempts"`) instead of faking a "done" result, and all 8
+failed jobs show `retry_count: 2`, confirming every one got its full retry
+budget before giving up. But 8 of 15 still ended up permanently failed.
+
+Root-caused from the worker's own "[job X] starting ... replica Y" log lines
+(unambiguous — logged by the real process, not inferred): **one specific
+replica (`1f85734d`) was unable to launch any browser for 26+ minutes
+straight**, cycling through job after job on its 2 slots — each one failing
+instantly, then immediately re-claiming the next pending job (including its
+own retries) within seconds. One error message gives the real signature:
+`pthread_create: Resource temporarily unavailable` — the classic Linux
+`pids.max` exhaustion error. The other 2 replicas were completely unaffected
+the entire time and ran jobs to completion normally (one finished with 1751
+emails found). Retrying doesn't help this failure mode: the retry keeps
+landing back on the same stuck replica, hammering an already-struggling
+container instead of giving it room to recover.
+
+**Fixes (`worker/main.py`, `worker/runner.py`):**
+- **Self-throttling.** `_check_pid_pressure()` reads this replica's own real
+  cgroup pids usage (`/sys/fs/cgroup/pids.current` / `pids.max`) every poll
+  cycle — direct measurement, not an inferred proxy like a failure count.
+  Above `PIDS_THROTTLE_THRESHOLD = 0.85`, it stops claiming new jobs while
+  letting existing work keep running, so a struggling replica naturally lets
+  the other replicas absorb new work instead of failing job after job in
+  place.
+- **Self-restart backstop.** If still blocked from claiming free capacity
+  after `MAX_PID_PRESSURE_DURATION_S = 300` (5 min) of throttling, that's not
+  transient business — it's genuinely stuck. The replica calls `os._exit(1)`
+  (deliberately bypassing normal exception handling, since a resource-starved
+  process might not complete a graceful shutdown either). Confirmed via
+  Railway's own docs: the default restart policy is On Failure, and a
+  non-zero exit restarts *only* the crashed replica — the other 2 are
+  untouched and keep serving the whole time.
+- **New `ReplicaResourceError`** (runner.py): raised when a phase's browser
+  subsystem can't start at all (Phase 1's initial launch, Phase 1's
+  exhausted-relaunch case, and a newly-caught Phase 3 gap — its initial
+  browser-pool launch previously failed *silently*, returning untouched
+  records so the job completed looking like a clean 0-email run instead of
+  failing). `_process_job`'s failure handler checks for this type
+  specifically and gives it `MAX_REPLICA_RESOURCE_RETRIES = 8` instead of the
+  normal `MAX_AUTO_RETRIES = 2` — landing on a struggling replica isn't the
+  job's fault, so it shouldn't burn through the same small budget meant for
+  genuine per-job problems. Both share the same `retry_count` column (no
+  schema change), just a different ceiling depending on which failure just
+  happened.
+
+Revert target: `worker-stable-step4` (tag) — before either 2026-09-18 fix.
+
+---
+
+## 2026-09-18 incident #1: Phase 1 browser death + zero-retry hard failures (fixed, deployed)
 
 Live-tested Step 4 at 3 replicas / 15 real jobs. Result: 6 jobs permanently
 failed and 1 "completed" with 100% cities done but zero real leads — all

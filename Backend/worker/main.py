@@ -44,6 +44,29 @@ Resilience (worker_heartbeats table, jobs.retry_count):
     task is merely hung, not dead, would create two coroutines writing the same
     job_id) before auto-requeuing it (bounded to MAX_AUTO_RETRIES) or, once
     exhausted, marking it permanently failed with a real client notification.
+
+2026-09-18 incident — replica-level self-healing:
+  - A single replica got stuck unable to launch any browser for 26+ minutes.
+    Every job that happened to retry onto it (jobs.retry_count exists
+    precisely for this) failed again too, because nothing stopped it from
+    continuing to claim new work it couldn't actually run — the retries
+    just kept hammering an already-struggling container instead of giving
+    it room to recover.
+  - _check_pid_pressure() reads this replica's own real cgroup pids usage
+    every poll cycle (not an inferred proxy like a failure count) and, above
+    PIDS_THROTTLE_THRESHOLD, pauses claiming NEW jobs — existing work keeps
+    running — so a struggling replica naturally lets the other replicas
+    absorb new work instead of failing job after job in place.
+  - If still blocked from claiming free capacity after
+    MAX_PID_PRESSURE_DURATION_S despite the pause, that's not transient
+    business, it's something genuinely stuck — the replica self-restarts
+    (os._exit, bypassing normal exception handling on purpose) so Railway
+    brings it back as a clean container, no human needing to notice.
+  - A failure whose signature is "the browser subsystem couldn't even start"
+    (runner.py's ReplicaResourceError) doesn't spend the job's
+    MAX_AUTO_RETRIES budget in _process_job's failure handler — landing on
+    a struggling replica isn't the job's fault, so it gets requeued for free
+    instead of burning through retries meant for genuine per-job problems.
 """
 
 import asyncio
@@ -51,6 +74,8 @@ import logging
 import os
 import signal
 import sys
+import time
+from pathlib import Path
 
 import asyncpg
 
@@ -59,7 +84,7 @@ from app.jobs_reset import reset_job_to_pending
 from app.leads_index import index_business_job_files
 from app.notifications import create_notification
 from app.storage import delete_object, try_download_object, upload_csv
-from worker.runner import run_scrape_job
+from worker.runner import ReplicaResourceError, run_scrape_job
 
 # UTF-8 defense-in-depth: hardcoded emoji were already removed from log messages
 # below, but *dynamic* content (a scraped business name, an exception message) can
@@ -105,6 +130,13 @@ STUCK_THRESHOLD_MIN = 10       # was 5 — Phase 3's EMAIL_CRAWL_TIMEOUT is 240s
                                 # enrichment's own worst-case gap is still only ~2.8min;
                                 # Phase 1 is separately time-bounded (runner.py)
 MAX_AUTO_RETRIES = 2
+# A ReplicaResourceError (the browser subsystem couldn't even start) isn't the
+# job's fault — landing on a struggling replica is bad luck, not a genuine
+# per-job problem (2026-09-18 incident) — so it gets a much larger budget than
+# MAX_AUTO_RETRIES before permanently failing. Shares the same retry_count
+# column as MAX_AUTO_RETRIES (no schema change), just a different ceiling
+# depending on which kind of failure just happened.
+MAX_REPLICA_RESOURCE_RETRIES = 8
 POOL_FAILURE_THRESHOLD = 3     # consecutive heartbeat failures before pool recreation
 
 # Step 4 (horizontal replicas): was a hardcoded "primary" — every replica would
@@ -122,6 +154,13 @@ _running: dict[str, str] = {}
 # auto-requeuing its job, instead of racing a second coroutine against it.
 _running_tasks: dict[str, asyncio.Task] = {}
 _shutdown = False
+
+# ── Self-throttling / self-restart on real resource pressure ───
+# See the 2026-09-18 incident note in the module docstring above.
+PIDS_THROTTLE_THRESHOLD = 0.85       # pause claiming new jobs at/above this utilization
+MAX_PID_PRESSURE_DURATION_S = 300    # still blocked from free capacity this long -> self-restart
+_pid_pressure_active = False
+_pid_pressure_started_at: float | None = None
 
 
 class PoolHolder:
@@ -258,6 +297,7 @@ async def _process_job(job: dict, pool: asyncpg.Pool, claim_token) -> None:
         # a fresh attempt, and writing 'failed' here would stomp on it. Skip the
         # destructive write (and the failure notification) unless we still own it.
         permanently_failed = False
+        is_replica_issue = isinstance(exc, ReplicaResourceError)
         async with pool.acquire() as conn:
             still_ours = claim_token is None or await conn.fetchval(
                 "SELECT started_at = $2 FROM jobs WHERE id = $1", job["id"], claim_token,
@@ -271,15 +311,20 @@ async def _process_job(job: dict, pool: asyncpg.Pool, claim_token) -> None:
                 # permanently failed 6 jobs on their very first attempt). Give a
                 # hard failure the same retry budget a stuck job already gets,
                 # sharing the same retry_count column so a job can't accumulate
-                # separate budgets per failure mode.
+                # separate budgets per failure mode. A ReplicaResourceError
+                # specifically gets a much larger budget (see
+                # MAX_REPLICA_RESOURCE_RETRIES) since that failure mode isn't
+                # the job's fault at all.
                 current_retry_count = await conn.fetchval(
                     "SELECT retry_count FROM jobs WHERE id = $1", job["id"]
                 )
-                if current_retry_count < MAX_AUTO_RETRIES:
+                retry_limit = MAX_REPLICA_RESOURCE_RETRIES if is_replica_issue else MAX_AUTO_RETRIES
+                if current_retry_count < retry_limit:
                     async with conn.transaction():
                         await reset_job_to_pending(conn, job["id"], bump_retry_count=True)
-                    log.warning(f"[job {job_id[:8]}] hard failure — auto-requeued "
-                                f"(attempt {current_retry_count + 1}/{MAX_AUTO_RETRIES}): {exc}")
+                    kind = "replica resource issue" if is_replica_issue else "hard failure"
+                    log.warning(f"[job {job_id[:8]}] {kind} — auto-requeued "
+                                f"(attempt {current_retry_count + 1}/{retry_limit}): {exc}")
                 else:
                     permanently_failed = True
                     await conn.execute(
@@ -305,6 +350,77 @@ async def _process_job(job: dict, pool: asyncpg.Pool, claim_token) -> None:
         _running.pop(job_id, None)
         _running_tasks.pop(job_id, None)
         log.info(f"[job {job_id[:8]}] slot freed — {len(_running)}/{MAX_GLOBAL_CONCURRENT} slots now used")
+
+
+def _read_pids_usage() -> tuple[int, int] | None:
+    """Read this container's own real cgroup v2 pids usage directly — this
+    worker process runs inside that cgroup, so it's the most direct signal
+    of resource pressure there is, unlike inferring "broken" from a failure
+    count. Returns None (never throttle) on any read failure or an
+    unlimited ("max") pids.max — e.g. local non-Linux dev, or a cgroup
+    layout Railway doesn't use here."""
+    try:
+        current = int(Path("/sys/fs/cgroup/pids.current").read_text().strip())
+        raw_max = Path("/sys/fs/cgroup/pids.max").read_text().strip()
+        if raw_max == "max":
+            return None
+        maximum = int(raw_max)
+        if maximum <= 0:
+            return None
+        return current, maximum
+    except Exception:
+        return None
+
+
+def _check_pid_pressure(free_slots: int) -> bool:
+    """True if this replica should skip claiming new jobs this cycle.
+
+    The restart timer only arms while free_slots > 0 AND pressure is high —
+    i.e. this replica has room to do more work but is blocked from claiming
+    it — not while both slots are simply, legitimately busy (2 genuinely
+    heavy jobs can also run pids high without anything being wrong; that
+    case never reaches this branch since free_slots would be 0 then).
+    """
+    global _pid_pressure_active, _pid_pressure_started_at
+    usage = _read_pids_usage()
+    if usage is None:
+        _pid_pressure_active = False
+        _pid_pressure_started_at = None
+        return False
+
+    current, maximum = usage
+    under_pressure = (current / maximum) >= PIDS_THROTTLE_THRESHOLD
+    blocked_from_work = under_pressure and free_slots > 0
+
+    if blocked_from_work:
+        if not _pid_pressure_active:
+            _pid_pressure_active = True
+            _pid_pressure_started_at = time.monotonic()
+            log.warning(f"[replica {REPLICA_ID}] under pid pressure ({current}/{maximum} = "
+                        f"{current/maximum:.0%}) with free capacity — pausing new job claims until it clears")
+        elif time.monotonic() - _pid_pressure_started_at >= MAX_PID_PRESSURE_DURATION_S:
+            log.error(f"[replica {REPLICA_ID}] still blocked from claiming free capacity after "
+                       f"{MAX_PID_PRESSURE_DURATION_S}s of pid pressure ({current}/{maximum}) — "
+                       f"restarting this replica so Railway brings it back clean")
+            # os._exit, not raise/sys.exit: _poll_loop's own per-cycle
+            # try/except would just catch and log a normal exception, and
+            # the whole point here is that the container is stuck — an
+            # immediate, unconditional exit is what a proven-effective plain
+            # restart already does for this exact symptom (2026-09-14/18
+            # incidents), without waiting on any graceful-shutdown path that
+            # a genuinely resource-starved process might not complete either.
+            # Railway's default restart policy is On Failure (confirmed via
+            # its docs) — a non-zero exit restarts ONLY this one replica; the
+            # other replicas are untouched and keep serving traffic the whole
+            # time, matching exactly what this fix is for.
+            os._exit(1)
+    else:
+        if _pid_pressure_active:
+            log.warning(f"[replica {REPLICA_ID}] pid pressure cleared ({current}/{maximum}) — resuming job claims")
+        _pid_pressure_active = False
+        _pid_pressure_started_at = None
+
+    return under_pressure
 
 
 async def _write_heartbeat(holder: PoolHolder) -> None:
@@ -350,7 +466,7 @@ async def _poll_loop(holder: PoolHolder) -> None:
             candidates: list = []
             claim_tokens: dict = {}
 
-            if free_slots > 0:
+            if free_slots > 0 and not _check_pid_pressure(free_slots):
                 # Step 4: claim atomically. FOR UPDATE SKIP LOCKED lets multiple
                 # replicas poll concurrently without ever grabbing the same job —
                 # a second replica's SELECT simply never sees a row this one

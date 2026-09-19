@@ -367,6 +367,18 @@ async def _update_city(pool: asyncpg.Pool, job_id: str, city: str, **kwargs):
         await conn.execute(sql, job_id, city, *values)
 
 
+class ReplicaResourceError(Exception):
+    """Raised when a phase's browser subsystem can't get going at all — a
+    resource/environment problem with THIS replica right now (e.g. it's out
+    of pids and can't spawn Chrome), not a problem with the job itself.
+    worker/main.py's failure handler treats this differently from a generic
+    exception: it doesn't spend the job's retry budget, since landing on a
+    replica that happens to be struggling isn't the job's fault (2026-09-18
+    incident: retries kept landing back on the same stuck replica and
+    burned through their whole budget on an infrastructure problem)."""
+    pass
+
+
 async def _is_job_canceled(pool: asyncpg.Pool, job_id: str, claim_token=None) -> bool:
     """Cooperative stop-check, polled before starting each new unit of work in
     every phase, for two independent reasons to abandon this run:
@@ -809,8 +821,17 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str, claim_t
                 log.error(f"[job {job_id[:8]}] browser launch failed: {e}")
 
         if not browsers:
-            log.error(f"[job {job_id[:8]}] no browsers available for email scraping")
-            return pd.DataFrame(records)
+            # Every browser in the pool failed to even launch — a replica
+            # resource problem, not a job problem. Used to silently return the
+            # untouched records (every "Email" left blank, job completes
+            # looking like a clean run that just found nothing) — raise
+            # loudly instead, matching Phase 1's same-class fix, so this
+            # doesn't spend the job's retry budget and doesn't masquerade as
+            # a real empty result.
+            raise ReplicaResourceError(
+                f"Phase 3 (email crawl) could not launch any of its "
+                f"{EMAIL_BROWSER_POOL_SIZE} browsers"
+            )
 
         log.info(f"[job {job_id[:8]}] email browser pool: {len(browsers)} browsers ready")
 
@@ -1137,7 +1158,13 @@ async def run_scrape_job(
                 # single-browser/multi-context design) — _scrape_city already
                 # closes its own context, so no extra cleanup needed here.
                 async with async_playwright() as p:
-                    browser = await p.chromium.launch(channel="chrome", headless=True, slow_mo=0)
+                    try:
+                        browser = await p.chromium.launch(channel="chrome", headless=True, slow_mo=0)
+                    except Exception as e:
+                        # Can't even get the first browser up — a replica
+                        # resource problem, not a job problem (see
+                        # ReplicaResourceError). Nothing to clean up yet.
+                        raise ReplicaResourceError(f"Phase 1 (Google Maps) could not launch its browser: {e}")
                     browser_ref = [browser]  # mutable — relaunch_browser() below swaps this out
                     # try/finally guarantees browser.close() runs even if this is
                     # cancelled externally (watchdog rescuing a stuck job) —
@@ -1242,7 +1269,7 @@ async def run_scrape_job(
                         await asyncio.gather(*[scrape_one_city(city) for city in cities],
                                             return_exceptions=True)
                         if phase1_dead[0]:
-                            raise RuntimeError(
+                            raise ReplicaResourceError(
                                 f"Phase 1 (Google Maps) browser became unrecoverable after "
                                 f"{MAX_BROWSER_RELAUNCHES} relaunch attempts"
                             )
