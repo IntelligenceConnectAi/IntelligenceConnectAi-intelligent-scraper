@@ -985,15 +985,35 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str, claim_t
                             # duplicate job run as first suspected.)
                             return
 
-                        consecutive_failures[0] = 0
                         row["Email"] = await asyncio.wait_for(
                             _crawl_site_for_email(ctx, row["Website"]),
                             timeout=EMAIL_CRAWL_TIMEOUT,
                         )
+                        # Only reset on a genuinely completed crawl — resetting right
+                        # after context creation succeeded (the old behavior) missed
+                        # a real failure mode: the context opens fine but the shared
+                        # browser underneath it is already silently broken, so every
+                        # actual crawl attempted on it fails instantly. Confirmed
+                        # live: hundreds of ZeroDivisionErrors (from Playwright's own
+                        # connection handling, not this file — there is no division
+                        # anywhere in this file's email-crawl path) landed within the
+                        # same second at the tail of a job, while this counter stayed
+                        # at 0 the whole time because it kept getting reset before
+                        # the crawl was ever attempted, so the pool never relaunched.
+                        consecutive_failures[0] = 0
                 except asyncio.TimeoutError:
                     log.warning(f"[job {job_id[:8]}] email timeout: {row.get('Website')}")
+                    consecutive_failures[0] += 1
+                    if consecutive_failures[0] >= CONSECUTIVE_FAILURE_THRESHOLD:
+                        await relaunch_pool()
                 except Exception as e:
-                    log.warning(f"[job {job_id[:8]}] email error: {type(e).__name__}")
+                    # exc_info=True (was just the type name) -- if this recurs, the
+                    # next occurrence gets a full traceback instead of another
+                    # guessing game.
+                    log.warning(f"[job {job_id[:8]}] email error: {type(e).__name__}", exc_info=True)
+                    consecutive_failures[0] += 1
+                    if consecutive_failures[0] >= CONSECUTIVE_FAILURE_THRESHOLD:
+                        await relaunch_pool()
                 finally:
                     if ctx:
                         try: await ctx.close()

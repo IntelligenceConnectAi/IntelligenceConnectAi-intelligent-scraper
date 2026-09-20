@@ -1,6 +1,45 @@
 # Worker performance baseline — revert references
 
-## 2026-09-18 incident #2: one replica stuck for 26+ min, retries kept re-hitting it (fixed — local, not yet deployed)
+## 2026-09-20 incident: pool self-healing missed a second failure mode (fixed — local, not yet deployed)
+
+After the 2026-09-18 replica self-healing fixes shipped, resubmitted jobs
+were still finishing "done" with very low email hit rates (single digits to
+~30%, vs the healthy 51-56% every other job in the same batch got). This
+looked at first like the Step 2 decoupled-browser-pool architecture itself
+being the problem — it wasn't. Direct log evidence: hundreds of
+`ZeroDivisionError`s landing within the same second, at the tail of a job.
+Grepped the whole file for division operators in the email-crawl path —
+there are none. This is coming from inside Playwright's own connection
+handling, almost certainly triggered when a shared browser's underlying pipe
+connection degrades under sustained load.
+
+**The real bug**: `_add_emails`'s pool-health counter (`consecutive_failures`,
+added 2026-09-15) only watched for "can't even open a browser context" — it
+reset to 0 the moment a context opened successfully, *before* the crawl on
+that context was even attempted. So a shared browser that opens contexts
+fine but fails every actual crawl on them (this exact incident) was
+completely invisible to the counter — it stayed at 0 through hundreds of
+failures, and the pool never relaunched.
+
+**Fix**: move the reset to only happen after a crawl genuinely completes;
+count a timeout or any other crawl-time exception toward the same
+consecutive-failure/relaunch trigger the context-open-failure path already
+had. Also upgraded the generic exception log from just the exception type
+name to a full traceback (`exc_info=True`), so any future recurrence is
+diagnosable immediately instead of needing another investigation like this
+one.
+
+**Explicitly not done**: no revert of Step 2's decoupled browser pool, or
+Step 4's replicas — the evidence points at a detection gap, not a flawed
+architecture, and Step 2 alone proved a real ~2.4x throughput gain worth
+keeping.
+
+Revert target: the previous commit (self-throttling/self-restart fixes,
+already deployed) if this proves unstable.
+
+---
+
+## 2026-09-18 incident #2: one replica stuck for 26+ min, retries kept re-hitting it (fixed, deployed)
 
 Deployed the Phase 1 self-healing + retry-on-hard-failure fix below, then
 live-tested it by resubmitting a real 15-job batch. Both fixes worked exactly
