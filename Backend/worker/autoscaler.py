@@ -103,9 +103,7 @@ async def _set_replicas(client: httpx.AsyncClient, n: int) -> None:
 
 
 async def main() -> None:
-    from app.config import settings  # same DB settings the worker/API already use
-
-    conn = await asyncpg.connect(settings.database_url, statement_cache_size=0)
+    conn = await asyncpg.connect(os.environ["DATABASE_URL"], statement_cache_size=0)
     try:
         row = await conn.fetchrow(
             """
