@@ -26,7 +26,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 
 from app.audit import log_audit
 from app.deps import CurrentUserDep, DBConn, get_current_org_id
-from app.leads_usage import get_leads_used_period
+from app.leads_usage import get_effective_monthly_limit, get_leads_used_period
 from app.notifications import create_notification, notify_admins_with_permission
 from app.org_access import get_billing_owner_id
 from app.schemas import (
@@ -115,7 +115,9 @@ async def create_people_lead_request(
                 detail="No active subscription. Please subscribe to a plan.",
             )
 
-        monthly_limit = plan_row["monthly_limit"]
+        monthly_limit = await get_effective_monthly_limit(
+            db, org_id, plan_row["monthly_limit"], plan_row["current_period_end"]
+        )
         used = await get_leads_used_period(db, user.id, org_id, plan_row["current_period_end"])
         if monthly_limit and used + body.requested_quantity > monthly_limit:
             remaining = max(monthly_limit - used, 0)

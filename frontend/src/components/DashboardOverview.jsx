@@ -118,7 +118,7 @@ export default function DashboardOverview({ onNavigate, profile, theme }) {
 
       {SHOW_KPI_ROW && (
         <div className="dashboard-grid">
-          <div className="span-3 span-xl-3"><StatCard icon={Gauge} label="Monthly Lead Limit" value={data.monthly_limit ?? 0} delay={0} /></div>
+          <div className="span-3 span-xl-3"><StatCard icon={Gauge} label="Monthly Lead Limit" value={data.effective_monthly_limit ?? data.monthly_limit ?? 0} delay={0} /></div>
           <div className="span-3 span-xl-3"><StatCard icon={TrendingUp} label="Leads Used" value={data.leads_used_period} accent delay={1} /></div>
           <div className="span-3 span-xl-3"><StatCard icon={Layers} label="Leads Remaining" value={data.leads_remaining_period} delay={2} /></div>
           <div className="span-3 span-xl-3"><StatCard icon={LoaderCircle} label="Leads Processing" value={data.leads_processing} delay={3} /></div>
@@ -175,7 +175,7 @@ export default function DashboardOverview({ onNavigate, profile, theme }) {
             key={theme}
             used={data.leads_used_period}
             remaining={data.leads_remaining_period}
-            limit={data.monthly_limit ?? 0}
+            limit={data.effective_monthly_limit ?? data.monthly_limit ?? 0}
             renewalDate={data.package_renewal_date}
             daysUntilReset={data.days_until_reset}
             processingCount={data.leads_processing}

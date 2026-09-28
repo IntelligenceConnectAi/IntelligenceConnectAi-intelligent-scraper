@@ -81,6 +81,11 @@ export const api = {
 
   // Billing
   createCheckout: (price_id)   => apiFetch("/billing/checkout", { method: "POST", body: JSON.stringify({ price_id }) }),
+  createTopupCheckout: (quantity, successUrl, cancelUrl) =>
+    apiFetch("/billing/topup/checkout", {
+      method: "POST",
+      body: JSON.stringify({ quantity, success_url: successUrl, cancel_url: cancelUrl }),
+    }),
   getBillingPortal: ()         => apiFetch("/billing/portal"),
 
   // Client-safe Business Requests (Phase 2 — sanitized presentation layer)

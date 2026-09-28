@@ -12,7 +12,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
 
-from app.deps import CurrentUserDep, DBConn
+from app.deps import CurrentUserDep, DBConn, get_current_org_id
+from app.leads_usage import get_effective_monthly_limit, get_leads_used_period
 from app.notifications import create_notification, notify_admins_with_permission
 from app.schemas import CreateJobRequest, JobResponse, JobSummary
 from app.security_utils import safe_filename
@@ -40,7 +41,8 @@ async def create_job(body: CreateJobRequest, user: CurrentUserDep, db: DBConn):
         plan = await db.fetchrow(
             """
             SELECT p.leads_per_day, p.leads_per_month,
-                   p.cities_per_job, p.concurrent_jobs, p.email_scraping
+                   p.cities_per_job, p.concurrent_jobs, p.email_scraping,
+                   s.current_period_end
             FROM subscriptions s
             JOIN plans p ON p.id = s.plan_id
             WHERE s.user_id = $1 AND s.status = 'active'
@@ -72,6 +74,23 @@ async def create_job(body: CreateJobRequest, user: CurrentUserDep, db: DBConn):
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail=result["reason"],
+            )
+
+        # 3b. Monthly lead limit check (mirrors people_leads.py's 429 pattern —
+        # Business Leads previously had no monthly gate at all, only the daily
+        # one above). Kept scoped to user.id, not the org's billing owner —
+        # matches this function's existing (documented) behavior that a
+        # non-owner without a personal subscriptions row can't submit jobs.
+        org_id = await get_current_org_id(db, user.id)
+        monthly_limit = await get_effective_monthly_limit(
+            db, org_id, plan["leads_per_month"], plan["current_period_end"]
+        )
+        estimated_leads = len(body.cities) * 60
+        used = await get_leads_used_period(db, user.id, org_id, plan["current_period_end"])
+        if monthly_limit and used + estimated_leads > monthly_limit:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"This request would exceed your monthly lead limit. {max(monthly_limit - used, 0)} leads remaining this period.",
             )
 
         # 4. Concurrent jobs check

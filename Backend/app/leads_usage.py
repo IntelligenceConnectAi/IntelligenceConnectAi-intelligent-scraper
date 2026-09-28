@@ -69,6 +69,30 @@ async def get_leads_used_period(
     return (business_used or 0) + (people_used or 0)
 
 
+async def get_effective_monthly_limit(
+    conn: asyncpg.Connection,
+    org_id,
+    plan_monthly_limit: Optional[int],
+    current_period_end: Optional[datetime],
+) -> int:
+    """plan_monthly_limit + any 'paid' lead_topups whose stamped period_end matches
+    the CURRENT period (see migrations/0012_lead_topups.sql). Keyed by org_id, not
+    user_id, matching how the base plan limit is already treated as an org-wide
+    pool elsewhere in this file. A topup can only ever be purchased against a real
+    current_period_end (see billing.py::create_topup_checkout), so there's nothing
+    to look up when there's no active subscription."""
+    if not plan_monthly_limit or not current_period_end:
+        return plan_monthly_limit or 0
+    topup_total = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(package_size), 0) FROM lead_topups
+        WHERE organization_id = $1 AND status = 'paid' AND period_end = $2
+        """,
+        org_id, current_period_end,
+    )
+    return plan_monthly_limit + (topup_total or 0)
+
+
 def days_until(target: Optional[datetime]) -> Optional[int]:
     if not target:
         return None

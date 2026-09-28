@@ -155,7 +155,9 @@ async def test_plan_change_updates_subscription_and_defaults_to_active_status(
     assert row["status"] == "active"
 
     resp = await client.get(f"/admin/clients/{org_id}", headers=make_headers(super_admin))
-    assert resp.json()["plan_name"] == "Pro"
+    # plan_id="pro" is branded "Growth" since migrations/0012_lead_topups.sql's
+    # rename (plans.id stays stable, only the display name changed).
+    assert resp.json()["plan_name"] == "Growth"
 
 
 async def test_plan_change_rejects_unknown_plan_id(client, db_conn, auth_user_pool, make_headers):

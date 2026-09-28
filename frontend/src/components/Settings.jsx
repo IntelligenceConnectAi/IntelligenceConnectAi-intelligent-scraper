@@ -45,28 +45,40 @@ const PRICE_IDS = {
   enterprise: import.meta.env.VITE_STRIPE_ENTERPRISE_PRICE_ID || "",
 };
 
+// NOTE: `id` deliberately stays the legacy internal identifier (matches
+// plans.id / STRIPE_*_PRICE_ID env vars in the backend) — only `name` and
+// `features` reflect the current user-facing rebrand. id="pro" is branded
+// "Growth"; id="elite" is branded "Pro". See migrations/0012_lead_topups.sql.
 const PLANS = [
   {
     id: "starter", name: "Starter", price: 49, priceId: PRICE_IDS.starter,
-    features: ["5,000 leads/month", "167 leads per day", "10 cities per job", "Phone, address, website", "7-day history"],
+    features: ["10,000 leads/month", "333 leads per day", "10 cities per job", "Phone, address, website", "7-day history"],
     popular: false,
   },
   {
-    id: "pro", name: "Pro", price: 197, priceId: PRICE_IDS.pro,
-    features: ["40,000 leads/month", "1,333 leads per day", "30 cities per job", "Email scraping included", "30-day history"],
+    id: "pro", name: "Growth", price: 197, priceId: PRICE_IDS.pro,
+    features: ["25,000 leads/month", "833 leads per day", "30 cities per job", "Email scraping included", "30-day history"],
     popular: true,
   },
   {
-    id: "elite", name: "Elite", price: 397, priceId: PRICE_IDS.elite,
-    features: ["100,000 leads/month", "3,333 leads per day", "100 cities per job", "Email scraping included", "365-day history + API access"],
+    id: "elite", name: "Pro", price: 397, priceId: PRICE_IDS.elite,
+    features: ["50,000 leads/month", "1,667 leads per day", "100 cities per job", "Email scraping included", "365-day history + API access"],
     popular: false,
   },
   {
     id: "enterprise", name: "Enterprise", price: 1500, priceId: PRICE_IDS.enterprise,
-    features: ["250,000+ leads/month", "8,333+ leads per day", "Unlimited cities per job", "Email scraping included", "Dedicated support + custom SLA"],
+    features: ["125,000+ leads/month", "4,167+ leads per day", "Unlimited cities per job", "Email scraping included", "Dedicated support + custom SLA"],
     popular: false, isEnterprise: true,
   },
 ];
+
+// Additional-records top-ups: flat $0.025/record, sold in fixed package sizes.
+// Eligibility (a plan may buy a package up to 100% of its own monthly limit)
+// is computed at render time from the caller's plan.monthly_limit, not
+// hardcoded per package — see the "available to" column in the pricing
+// reference this was built from.
+const TOPUP_PACKAGES = [1000, 2500, 5000, 10000, 25000, 50000];
+const TOPUP_PRICE_PER_RECORD = 0.025;
 
 function PricingCard({ name, price, priceId, features, popular, current, onBuy, loading, isEnterprise }) {
   return (
@@ -193,6 +205,7 @@ function ProfileSection({ profile, onProfileUpdated, onLogout }) {
 function BillingSection({ plan, theme }) {
   const [checkoutLoading, setCheckoutLoading] = useState(false);
   const [portalLoading, setPortalLoading]     = useState(false);
+  const [topupLoading, setTopupLoading]       = useState(null); // holds the quantity being purchased, or null
   const [billingError, setBillingError]       = useState("");
   const [dashboard, setDashboard]             = useState(null);
   const [invoices, setInvoices]               = useState([]);
@@ -224,6 +237,19 @@ function BillingSection({ plan, theme }) {
       setBillingError(e.message);
     } finally {
       setCheckoutLoading(false);
+    }
+  };
+
+  const handleBuyTopup = async (quantity) => {
+    setTopupLoading(quantity); setBillingError("");
+    try {
+      const res = await api.createTopupCheckout(quantity, window.location.href, window.location.href);
+      if (res.checkout_url) window.location.href = res.checkout_url;
+      else setBillingError("No checkout URL received");
+    } catch (e) {
+      setBillingError(e.message);
+    } finally {
+      setTopupLoading(null);
     }
   };
 
@@ -339,13 +365,70 @@ function BillingSection({ plan, theme }) {
                 key={theme}
                 used={dashboard?.leads_used_period ?? 0}
                 remaining={dashboard?.leads_remaining_period ?? 0}
-                limit={plan.monthly_limit ?? 0}
+                limit={dashboard?.effective_monthly_limit ?? plan.monthly_limit ?? 0}
                 renewalDate={dashboard?.package_renewal_date}
                 daysUntilReset={dashboard?.days_until_reset}
                 processingCount={dashboard?.leads_processing}
               />
+              {dashboard?.effective_monthly_limit > (plan.monthly_limit ?? 0) && (
+                <p className="text-xs mt-2 text-center" style={{ color: "var(--accent)" }}>
+                  +{(dashboard.effective_monthly_limit - plan.monthly_limit).toLocaleString()} extra this period
+                </p>
+              )}
             </div>
           </div>
+
+          {/* Additional records top-up */}
+          {isOwner && currentPlanId && currentPlanId !== "enterprise" && (
+            <div className="dashboard-grid">
+              <div className="span-12">
+                <div className="dashboard-panel" style={{ padding: 0, overflow: "hidden" }}>
+                  <div className="px-5 py-3.5" style={{ borderBottom: "1px solid var(--border-soft)" }}>
+                    <p className="section-title" style={{ margin: 0 }}>Buy additional records</p>
+                    <p className="text-xs mt-1" style={{ color: "var(--text-muted)" }}>
+                      Need more capacity this period? Top up instantly — added records apply immediately and expire at your next renewal.
+                    </p>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full">
+                      <thead>
+                        <tr style={{ borderBottom: "1px solid var(--border-soft)" }}>
+                          {["Additional records", "You pay", ""].map(h => (
+                            <th key={h} className="px-4 py-3 text-left text-xs font-medium tracking-wider uppercase" style={{ color: "var(--text-muted)" }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {TOPUP_PACKAGES.map((qty, i) => {
+                          const eligible = qty <= (plan.monthly_limit ?? 0);
+                          const price = (qty * TOPUP_PRICE_PER_RECORD).toFixed(2);
+                          return (
+                            <tr key={qty} style={{ borderTop: i > 0 ? "1px solid var(--border-soft)" : "none", opacity: eligible ? 1 : 0.4 }}>
+                              <td className="px-4 py-3 text-sm mono font-semibold" style={{ color: "var(--text-primary)" }}>+{qty.toLocaleString()}</td>
+                              <td className="px-4 py-3 text-sm mono" style={{ color: "var(--text-secondary)" }}>${price}</td>
+                              <td className="px-4 py-3 text-right">
+                                {eligible ? (
+                                  <button onClick={() => handleBuyTopup(qty)} disabled={topupLoading !== null}
+                                    className="btn-ghost text-xs">
+                                    {topupLoading === qty ? "Redirecting…" : "Buy →"}
+                                  </button>
+                                ) : (
+                                  <span className="text-xs" style={{ color: "var(--text-muted)" }}>Requires a higher plan</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <p className="text-xs px-4 py-3" style={{ color: "var(--text-muted)", borderTop: "1px solid var(--border-soft)" }}>
+                    Additional capacity is limited to up to 100% more than your plan's included amount. If you consistently need more, consider upgrading your plan instead.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Payment method */}
           <div className="dashboard-grid">

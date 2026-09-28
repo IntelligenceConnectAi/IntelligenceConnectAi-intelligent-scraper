@@ -4,6 +4,7 @@ minimal. Every insert here happens on the test's own transactional connection
 (see conftest.py) and rolls back automatically at teardown.
 """
 
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from app.storage import upload_csv
@@ -81,15 +82,17 @@ async def grant_permission(conn, admin_user_id, permission_key, *, granted_by=No
     )
 
 
-async def make_job(conn, user_id, *, status="pending", industry="plumbers", state="FL", cities=None, total_clean=0):
+async def make_job(conn, user_id, *, status="pending", industry="plumbers", state="FL", cities=None, total_clean=0, completed_at=None):
     cities = cities or ["Miami"]
+    if completed_at is None and status == "done":
+        completed_at = datetime.now(timezone.utc)
     row = await conn.fetchrow(
         """
-        INSERT INTO jobs (user_id, industry, state, cities, status, cities_total, total_clean)
-        VALUES ($1,$2,$3,$4,$5,$6,$7)
+        INSERT INTO jobs (user_id, industry, state, cities, status, cities_total, total_clean, completed_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
         RETURNING id
         """,
-        user_id, industry, state, cities, status, len(cities), total_clean,
+        user_id, industry, state, cities, status, len(cities), total_clean, completed_at,
     )
     return row["id"]
 
@@ -132,6 +135,30 @@ async def make_lead_file(
         """,
         org_id, user_id, source_type, source_id or uuid4(), file_category, display_name,
         storage_path, record_count,
+    )
+    return row["id"]
+
+
+async def make_lead_topup(
+    conn, org_id, purchased_by_user_id, *, package_size=1000, status="paid",
+    plan_id="starter", period_start=None, period_end=None, stripe_checkout_session_id=None,
+):
+    """Mirrors make_subscription's default 30-day window shape — pass an explicit
+    period_end to simulate a topup stamped for a prior (already-rolled-over) period."""
+    if period_end is None:
+        period_end = datetime.now(timezone.utc) + timedelta(days=30)
+    if period_start is None:
+        period_start = period_end - timedelta(days=30)
+    row = await conn.fetchrow(
+        """
+        INSERT INTO lead_topups
+            (organization_id, purchased_by_user_id, plan_id, package_size, amount_paid,
+             stripe_checkout_session_id, status, period_start, period_end)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        RETURNING id
+        """,
+        org_id, purchased_by_user_id, plan_id, package_size, package_size * 0.025,
+        stripe_checkout_session_id or f"cs_test_{uuid4().hex[:16]}", status, period_start, period_end,
     )
     return row["id"]
 

@@ -12,7 +12,8 @@ from pydantic import BaseModel
 
 from app.audit import log_audit
 from app.config import settings
-from app.deps import CurrentUserDep, DBConn
+from app.deps import CurrentUserDep, DBConn, get_current_org_id
+from app.leads_usage import compute_period_window
 from app.notifications import create_notification, notify_admins_with_permission
 from app.org_access import RequireOrgRole
 from app.schemas import InvoiceResponse, PaymentMethodResponse
@@ -25,6 +26,12 @@ router = APIRouter()
 stripe.api_key = settings.stripe_secret_key
 
 PRICE_TO_PLAN: dict[str, str] = settings.stripe_price_to_plan
+
+# Additional-records top-ups: flat $0.025/record, sold in fixed package sizes.
+# A plan may only buy a package up to 100% of its own leads_per_month (enforced
+# in create_topup_checkout, not hardcoded per package here).
+ALLOWED_TOPUP_SIZES = {1000, 2500, 5000, 10000, 25000, 50000}
+PRICE_PER_RECORD = Decimal("0.025")
 
 
 def _sb_headers() -> dict:
@@ -50,20 +57,16 @@ def _build_checkout_urls(body: "CheckoutRequest", user_email: str) -> tuple[str,
     return success_url, cancel_url
 
 
-@router.post("/checkout")
-async def create_checkout(
-    body: CheckoutRequest, user: CurrentUserDep, db: DBConn,
-    _membership: Annotated[dict, Depends(RequireOrgRole("account_owner"))],
-):
-    if body.price_id not in PRICE_TO_PLAN:
-        raise HTTPException(status_code=400, detail="Invalid price ID")
-
+async def _get_or_create_stripe_customer(db, user) -> str:
+    """Shared by create_checkout and create_topup_checkout. Verifies an existing
+    stripe_customer_id still resolves in Stripe (a test-mode reset or manual
+    deletion on Stripe's side would otherwise leave a dangling id), creating a
+    fresh customer if needed."""
     row = await db.fetchrow(
         "SELECT stripe_customer_id FROM users WHERE id = $1", user.id
     )
     customer_id = row["stripe_customer_id"] if row else None
 
-    # Verify customer still exists in Stripe
     if customer_id:
         try:
             stripe.Customer.retrieve(customer_id)
@@ -84,6 +87,18 @@ async def create_checkout(
             "UPDATE users SET stripe_customer_id = $2 WHERE id = $1",
             user.id, customer_id,
         )
+    return customer_id
+
+
+@router.post("/checkout")
+async def create_checkout(
+    body: CheckoutRequest, user: CurrentUserDep, db: DBConn,
+    _membership: Annotated[dict, Depends(RequireOrgRole("account_owner"))],
+):
+    if body.price_id not in PRICE_TO_PLAN:
+        raise HTTPException(status_code=400, detail="Invalid price ID")
+
+    customer_id = await _get_or_create_stripe_customer(db, user)
 
     success_url, cancel_url = _build_checkout_urls(body, user.email)
 
@@ -96,6 +111,93 @@ async def create_checkout(
         cancel_url=cancel_url,
         metadata={"supabase_user_id": str(user.id)},
     )
+    return {"checkout_url": session.url}
+
+
+class TopupCheckoutRequest(BaseModel):
+    quantity: int
+    success_url: Optional[str] = None
+    cancel_url: Optional[str] = None
+
+
+@router.post("/topup/checkout")
+async def create_topup_checkout(
+    body: TopupCheckoutRequest, user: CurrentUserDep, db: DBConn,
+    _membership: Annotated[dict, Depends(RequireOrgRole("account_owner"))],
+):
+    """One-time (mode='payment') Stripe Checkout for additional-records top-ups —
+    distinct from create_checkout's mode='subscription' flow above. Gated to the
+    account owner because the charge lands on users.stripe_customer_id, which is
+    only ever set on the owner (see _org_id_for_stripe_customer's docstring)."""
+    plan_row = await db.fetchrow(
+        """
+        SELECT p.id AS plan_id, p.leads_per_month, s.current_period_end
+        FROM subscriptions s JOIN plans p ON p.id = s.plan_id
+        WHERE s.user_id = $1 AND s.status = 'active'
+        """,
+        user.id,
+    )
+    if not plan_row:
+        raise HTTPException(status_code=403, detail="No active subscription. Please subscribe to a plan.")
+    if not plan_row["current_period_end"]:
+        raise HTTPException(status_code=400, detail="Your subscription is missing billing period information. Please contact support.")
+    if plan_row["plan_id"] == "enterprise":
+        raise HTTPException(status_code=400, detail="Enterprise plans are custom — contact sales for additional capacity.")
+    if body.quantity not in ALLOWED_TOPUP_SIZES:
+        raise HTTPException(status_code=400, detail=f"Quantity must be one of: {sorted(ALLOWED_TOPUP_SIZES)}")
+    # Compared against the plan's static limit, never an already-boosted effective
+    # limit — otherwise topups could chain to unlock ever-larger topups.
+    if body.quantity > (plan_row["leads_per_month"] or 0):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Your plan allows topups up to {plan_row['leads_per_month']:,} records at a time.",
+        )
+
+    org_id = await get_current_org_id(db, user.id)
+    customer_id = await _get_or_create_stripe_customer(db, user)
+    period_start, period_end = compute_period_window(plan_row["current_period_end"])
+    amount = body.quantity * PRICE_PER_RECORD
+
+    success_url = body.success_url or f"{settings.frontend_base_url}/?topup=success"
+    cancel_url = body.cancel_url or f"{settings.frontend_base_url}/?topup=canceled"
+
+    session = stripe.checkout.Session.create(
+        customer=customer_id,
+        payment_method_types=["card"],
+        line_items=[{
+            "price_data": {
+                "currency": "usd",
+                "product_data": {"name": f"+{body.quantity:,} additional records"},
+                "unit_amount": int(amount * 100),
+            },
+            "quantity": 1,
+        }],
+        mode="payment",
+        # mode="payment" produces no Stripe Invoice by default (invoices are a
+        # subscription/invoice-item construct) — without this, a real charge would
+        # never show up in GET /billing/invoices despite the customer paying for it.
+        invoice_creation={"enabled": True},
+        success_url=success_url,
+        cancel_url=cancel_url,
+        metadata={
+            "kind": "lead_topup",
+            "supabase_user_id": str(user.id),
+            "organization_id": str(org_id),
+            "package_size": str(body.quantity),
+        },
+    )
+
+    await db.execute(
+        """
+        INSERT INTO lead_topups
+            (organization_id, purchased_by_user_id, plan_id, package_size, amount_paid,
+             stripe_checkout_session_id, status, period_start, period_end)
+        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)
+        """,
+        org_id, user.id, plan_row["plan_id"], body.quantity, amount,
+        session.id, period_start, period_end,
+    )
+
     return {"checkout_url": session.url}
 
 
@@ -225,6 +327,8 @@ async def stripe_webhook(request: Request, db: DBConn):
     try:
         if etype == "checkout.session.completed":
             await _handle_checkout_completed(data, db)
+        elif etype == "checkout.session.expired":
+            await _handle_checkout_expired(data, db)
         elif etype == "customer.subscription.updated":
             await _handle_subscription_updated(data, db)
         elif etype == "customer.subscription.deleted":
@@ -266,7 +370,56 @@ def _subscription_period_end(sub_data: dict) -> Optional[int]:
     return sub_data.get("current_period_end")
 
 
+async def _handle_topup_checkout_completed(s: dict, db) -> None:
+    """Fulfillment for the mode='payment' lead_topup checkout created in
+    create_topup_checkout. Marks the pending row paid without recomputing the
+    period window here — the window was already stamped at checkout-creation
+    time, which avoids misattributing the credit if a subscription renewal
+    happens to fire in the gap between checkout creation and payment completion.
+    The WHERE status='pending' guard makes this independently idempotent, on
+    top of the outer stripe_events ledger."""
+    row = await db.fetchrow(
+        """
+        UPDATE lead_topups SET status='paid', stripe_payment_intent_id=$2, updated_at=NOW()
+        WHERE stripe_checkout_session_id=$1 AND status='pending'
+        RETURNING organization_id, purchased_by_user_id, package_size
+        """,
+        s["id"], s.get("payment_intent"),
+    )
+    if not row:
+        log.info(f"Topup checkout {s['id']} already processed or unknown — no-op")
+        return
+    try:
+        await create_notification(
+            db, user_id=row["purchased_by_user_id"], category="billing_limits", type="topup_purchased",
+            title="Additional records purchased",
+            body=f"+{row['package_size']:,} additional records were added to your account for this billing period.",
+            link_section="settings", link_sub_tab="billing",
+        )
+    except Exception as e:
+        log.error(f"Topup purchase notification error: {e}", exc_info=True)
+
+
+async def _handle_checkout_expired(s: dict, db) -> None:
+    """A customer who abandons the Stripe checkout page for a topup would
+    otherwise leave a 'pending' lead_topups row forever — harmless (fulfillment
+    only ever looks at status='paid'), but confusing to debug. No-op for
+    subscription-mode sessions (metadata.kind won't be 'lead_topup')."""
+    metadata = s.get("metadata") or {}
+    if metadata.get("kind") != "lead_topup":
+        return
+    await db.execute(
+        "UPDATE lead_topups SET status='failed', updated_at=NOW() WHERE stripe_checkout_session_id=$1 AND status='pending'",
+        s["id"],
+    )
+
+
 async def _handle_checkout_completed(s: dict, db) -> None:
+    metadata = s.get("metadata") or {}
+    if metadata.get("kind") == "lead_topup":
+        await _handle_topup_checkout_completed(s, db)
+        return
+
     sub_id = s.get("subscription")
     if not sub_id:
         log.warning("No subscription in checkout.session.completed")
@@ -304,7 +457,6 @@ async def _handle_checkout_completed(s: dict, db) -> None:
     cancel_at = sub_data.get("cancel_at_period_end", False)
 
     # Check if this is an existing logged-in user (upgrading plan)
-    metadata    = s.get("metadata") or {}
     existing_user_id = metadata.get("supabase_user_id")
 
     if existing_user_id:

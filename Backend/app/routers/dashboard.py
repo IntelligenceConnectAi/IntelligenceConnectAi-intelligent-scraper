@@ -11,7 +11,7 @@ Client dashboard aggregation (Phase 3, extended in Phase 4 with People Leads):
 from fastapi import APIRouter
 
 from app.deps import CurrentUserDep, DBConn, get_current_org_id
-from app.leads_usage import days_until, get_leads_used_period
+from app.leads_usage import days_until, get_effective_monthly_limit, get_leads_used_period
 from app.schemas import ClientDashboardResponse, RecentFileSummary
 
 router = APIRouter()
@@ -39,9 +39,10 @@ async def get_client_dashboard(user: CurrentUserDep, db: DBConn):
     # Business leads (jobs.total_clean, by user_id) + delivered People Leads
     # (people_lead_requests.delivered_quantity, by org_id) — same helper the
     # People Leads create-request limit check uses, so the two can't disagree.
+    effective_monthly_limit = await get_effective_monthly_limit(db, org_id, monthly_limit, current_period_end)
     leads_used_period = await get_leads_used_period(db, user.id, org_id, current_period_end)
-    leads_remaining_period = max((monthly_limit or 0) - leads_used_period, 0)
-    pct_used = min(int(round((leads_used_period / monthly_limit) * 100)), 100) if monthly_limit else 0
+    leads_remaining_period = max(effective_monthly_limit - leads_used_period, 0)
+    pct_used = min(int(round((leads_used_period / effective_monthly_limit) * 100)), 100) if effective_monthly_limit else 0
 
     # Request counts — same window client_business.py's list endpoint uses, so the
     # dashboard KPIs and the Business Leads tab badges never disagree.
@@ -95,6 +96,7 @@ async def get_client_dashboard(user: CurrentUserDep, db: DBConn):
     return ClientDashboardResponse(
         plan_name=plan_row["plan_name"] if plan_row else None,
         monthly_limit=monthly_limit,
+        effective_monthly_limit=effective_monthly_limit if plan_row else None,
         subscription_status=plan_row["subscription_status"] if plan_row else None,
         package_renewal_date=current_period_end,
         cancel_at_period_end=plan_row["cancel_at_period_end"] if plan_row else None,

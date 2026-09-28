@@ -199,6 +199,7 @@ class ClientDashboardResponse(BaseModel):
     # Plan / period
     plan_name: Optional[str] = None
     monthly_limit: Optional[int] = None
+    effective_monthly_limit: Optional[int] = None  # monthly_limit + active lead_topups this period
     subscription_status: Optional[str] = None
     package_renewal_date: Optional[datetime] = None
     cancel_at_period_end: Optional[bool] = None
