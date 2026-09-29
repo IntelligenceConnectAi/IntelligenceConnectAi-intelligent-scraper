@@ -26,7 +26,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Global concurrency limit ──────────────────────────────────
-MAX_GLOBAL_CONCURRENT = 1   # max jobs running at once across all users
+MAX_GLOBAL_CONCURRENT = 2   # max jobs running at once across all users
 
 # job_id → user_id for currently running jobs
 _running: dict[str, str] = {}
@@ -59,13 +59,13 @@ async def _process_job(job: dict, pool: asyncpg.Pool) -> None:
                 "SELECT update_usage_after_job($1,$2,$3,$4,$5,$6)",
                 job["user_id"],
                 result["total_clean"],
-                result["with_website"],
+                result["with_email"] + result["no_email"],   # with_website = with_email + no_email
                 result["no_website"],
                 result["emails_found"],
-                result["with_website"],
+                result["with_email"] + result["no_email"],   # repeated arg (same as with_website)
             )
 
-        log.info(f"✅ Job {job_id[:8]} done — {result['total_clean']} leads, {result['emails_found']} emails  [{len(_running)-1}/{MAX_GLOBAL_CONCURRENT} slots used]")
+        log.info(f"✅ Job {job_id[:8]} done — {result['total_clean']} leads, {result['emails_found']} emails (with_email={result['with_email']}, no_email={result['no_email']}, no_website={result['no_website']})  [{len(_running)-1}/{MAX_GLOBAL_CONCURRENT} slots used]")
 
     except Exception as exc:
         log.error(f"❌ Job {job_id[:8]} failed: {exc}", exc_info=True)
