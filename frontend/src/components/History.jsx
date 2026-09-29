@@ -81,7 +81,7 @@ export default function History() {
         <table className="w-full">
           <thead>
             <tr style={{ borderBottom: "1px solid var(--border)" }}>
-              {["Industry","State","Cities","Status","Leads","Emails","Created",""].map(h => (
+              {["Industry","State","Cities","Status","Leads","Emails","Created","Downloads"].map(h => (
                 <th key={h} className="px-4 py-3 text-left text-xs font-medium tracking-wider uppercase" style={{ color: "var(--text-3)" }}>
                   {h}
                 </th>
@@ -109,16 +109,24 @@ export default function History() {
                 <td className="px-4 py-3 text-xs" style={{ color: "var(--text-3)" }}>{fmt(job.created_at)}</td>
                 <td className="px-4 py-3">
                   {job.status === "done" ? (
-                    <div className="flex gap-1.5">
-                      <button onClick={() => download(job.id, "with_website")}
-                        disabled={dl[`${job.id}-with_website`]}
-                        className="badge badge-accent cursor-pointer hover:opacity-80 transition disabled:opacity-40">
-                        {dl[`${job.id}-with_website`] ? "…" : "⬇ Web"}
+                    <div className="flex gap-1.5 flex-wrap">
+                      <button onClick={() => download(job.id, "with_email")}
+                        disabled={dl[`${job.id}-with_email`]}
+                        className="badge badge-accent cursor-pointer hover:opacity-80 transition disabled:opacity-40"
+                        title="With website + email">
+                        {dl[`${job.id}-with_email`] ? "…" : "⬇ Email"}
+                      </button>
+                      <button onClick={() => download(job.id, "no_email")}
+                        disabled={dl[`${job.id}-no_email`]}
+                        className="badge badge-blue cursor-pointer hover:opacity-80 transition disabled:opacity-40"
+                        title="With website, no email found">
+                        {dl[`${job.id}-no_email`] ? "…" : "⬇ No Email"}
                       </button>
                       <button onClick={() => download(job.id, "no_website")}
                         disabled={dl[`${job.id}-no_website`]}
-                        className="badge badge-muted cursor-pointer hover:opacity-80 transition disabled:opacity-40">
-                        {dl[`${job.id}-no_website`] ? "…" : "⬇ No web"}
+                        className="badge badge-muted cursor-pointer hover:opacity-80 transition disabled:opacity-40"
+                        title="No website">
+                        {dl[`${job.id}-no_website`] ? "…" : "⬇ No Web"}
                       </button>
                     </div>
                   ) : <span className="text-xs" style={{ color: "var(--text-3)" }}>—</span>}
@@ -146,9 +154,10 @@ export default function History() {
               <span style={{ color: "var(--text-3)" }}>{fmt(job.created_at)}</span>
             </div>
             {job.status === "done" && (
-              <div className="flex gap-2">
-                <button onClick={() => download(job.id, "with_website")} className="badge badge-accent cursor-pointer">⬇ With website</button>
-                <button onClick={() => download(job.id, "no_website")}   className="badge badge-muted cursor-pointer">⬇ No website</button>
+              <div className="flex gap-2 flex-wrap">
+                <button onClick={() => download(job.id, "with_email")}  className="badge badge-accent cursor-pointer">⬇ With Email</button>
+                <button onClick={() => download(job.id, "no_email")}    className="badge badge-blue cursor-pointer">⬇ No Email</button>
+                <button onClick={() => download(job.id, "no_website")}  className="badge badge-muted cursor-pointer">⬇ No Website</button>
               </div>
             )}
           </div>
