@@ -1,16 +1,5 @@
-"""
-Job endpoints:
-  POST   /jobs                    → create + queue job
-  GET    /jobs                    → list user's jobs
-  GET    /jobs/{job_id}           → single job + city progress
-  POST   /jobs/{job_id}/cancel    → cancel pending job
-  GET    /jobs/{job_id}/download/{file_type}  → signed CSV URL
-"""
-
 from uuid import UUID
-
 from fastapi import APIRouter, HTTPException, status
-
 from app.deps import CurrentUserDep, DBConn
 from app.schemas import CreateJobRequest, JobResponse, JobSummary
 from app.storage import get_signed_url
@@ -18,12 +7,8 @@ from app.storage import get_signed_url
 router = APIRouter()
 
 
-# ─────────────────────────────────────────────────────
-#  POST /jobs  — create & queue
-# ─────────────────────────────────────────────────────
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(body: CreateJobRequest, user: CurrentUserDep, db: DBConn):
-
     # 1. Load active plan
     plan = await db.fetchrow(
         """
@@ -42,19 +27,18 @@ async def create_job(body: CreateJobRequest, user: CurrentUserDep, db: DBConn):
             detail="No active subscription. Please subscribe to a plan.",
         )
 
-    # 2. Cities limit check
+    # 2. Cities limit
     max_cities = plan["cities_per_job"]
     if max_cities and len(body.cities) > max_cities:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Your plan allows max {max_cities} cities per job. You submitted {len(body.cities)}.",
+            detail=f"Your plan allows max {max_cities} cities per job.",
         )
 
-    # 3. Daily lead limit check
+    # 3. Daily limit
     result = await db.fetchrow(
         "SELECT * FROM can_user_scrape($1, $2)",
-        user.id,
-        len(body.cities) * 60,   # conservative estimate: ~60 leads per city
+        user.id, len(body.cities) * 60,
     )
     if result and not result["allowed"]:
         raise HTTPException(
@@ -62,57 +46,39 @@ async def create_job(body: CreateJobRequest, user: CurrentUserDep, db: DBConn):
             detail=result["reason"],
         )
 
-    # 4. Concurrent jobs check
-    running_count = await db.fetchval(
-        """
-        SELECT COUNT(*) FROM jobs
-        WHERE user_id = $1 AND status IN ('pending', 'running')
-        """,
+    # 4. Concurrent jobs
+    running = await db.fetchval(
+        "SELECT COUNT(*) FROM jobs WHERE user_id = $1 AND status IN ('pending','running')",
         user.id,
     )
-    if running_count >= plan["concurrent_jobs"]:
+    if running >= plan["concurrent_jobs"]:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"You already have {running_count} active job(s). Your plan allows {plan['concurrent_jobs']} concurrent job(s).",
+            detail=f"Max {plan['concurrent_jobs']} concurrent job(s) allowed on your plan.",
         )
 
-    # 5. Insert job
+    # 5. Create job
     job = await db.fetchrow(
         """
-        INSERT INTO jobs (
-            user_id, industry, state, cities,
-            cities_total, status, current_step
-        )
+        INSERT INTO jobs (user_id, industry, state, cities, cities_total, status, current_step)
         VALUES ($1, $2, $3, $4, $5, 'pending', 'step1_maps')
         RETURNING *
         """,
-        user.id,
-        body.industry,
-        body.state,
-        body.cities,
-        len(body.cities),
+        user.id, body.industry, body.state, body.cities, len(body.cities),
     )
 
-    # 6. Insert job_cities rows (for per-city progress)
+    # 6. Create per-city rows
     for city in body.cities:
         await db.execute(
-            """
-            INSERT INTO job_cities (job_id, city, maps_status, status)
-            VALUES ($1, $2, 'pending', 'pending')
-            """,
-            job["id"],
-            city,
+            "INSERT INTO job_cities (job_id, city, maps_status, status) VALUES ($1, $2, 'pending', 'pending')",
+            job["id"], city,
         )
 
     return JobResponse(**dict(job), city_progress=[])
 
 
-# ─────────────────────────────────────────────────────
-#  GET /jobs  — list user's jobs
-# ─────────────────────────────────────────────────────
 @router.get("", response_model=list[JobSummary])
 async def list_jobs(user: CurrentUserDep, db: DBConn):
-    # Respect plan history_retention_days
     rows = await db.fetch(
         """
         SELECT j.id, j.industry, j.state, j.cities, j.status,
@@ -130,79 +96,60 @@ async def list_jobs(user: CurrentUserDep, db: DBConn):
     return [JobSummary(**dict(r)) for r in rows]
 
 
-# ─────────────────────────────────────────────────────
-#  GET /jobs/{job_id}  — single job with city progress
-# ─────────────────────────────────────────────────────
 @router.get("/{job_id}", response_model=JobResponse)
 async def get_job(job_id: UUID, user: CurrentUserDep, db: DBConn):
     job = await db.fetchrow(
-        "SELECT * FROM jobs WHERE id = $1 AND user_id = $2",
-        job_id,
-        user.id,
+        "SELECT * FROM jobs WHERE id = $1 AND user_id = $2", job_id, user.id
     )
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(404, "Job not found")
 
     cities = await db.fetch(
         "SELECT city, maps_status, maps_leads FROM job_cities WHERE job_id = $1 ORDER BY id",
         job_id,
     )
-
-    return JobResponse(
-        **dict(job),
-        city_progress=[dict(c) for c in cities],
-    )
+    return JobResponse(**dict(job), city_progress=[dict(c) for c in cities])
 
 
-# ─────────────────────────────────────────────────────
-#  POST /jobs/{job_id}/cancel
-# ─────────────────────────────────────────────────────
 @router.post("/{job_id}/cancel")
 async def cancel_job(job_id: UUID, user: CurrentUserDep, db: DBConn):
     job = await db.fetchrow(
-        "SELECT id, status FROM jobs WHERE id = $1 AND user_id = $2",
-        job_id,
-        user.id,
+        "SELECT id, status FROM jobs WHERE id = $1 AND user_id = $2", job_id, user.id
     )
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(404, "Job not found")
     if job["status"] not in ("pending", "running"):
-        raise HTTPException(status_code=400, detail=f"Cannot cancel a job with status '{job['status']}'")
+        raise HTTPException(400, f"Cannot cancel a '{job['status']}' job")
 
     await db.execute(
-        "UPDATE jobs SET status = 'canceled', updated_at = NOW() WHERE id = $1",
-        job_id,
+        "UPDATE jobs SET status='canceled', updated_at=NOW() WHERE id=$1", job_id
     )
     return {"message": "Job canceled"}
 
 
-# ─────────────────────────────────────────────────────
-#  GET /jobs/{job_id}/download/{file_type}
-#  file_type: "with_website" or "no_website"
-# ─────────────────────────────────────────────────────
 @router.get("/{job_id}/download/{file_type}")
-async def download_job(
-    job_id: UUID,
-    file_type: str,
-    user: CurrentUserDep,
-    db: DBConn,
-):
-    if file_type not in ("with_website", "no_website"):
-        raise HTTPException(status_code=400, detail="file_type must be 'with_website' or 'no_website'")
+async def download_job(job_id: UUID, file_type: str, user: CurrentUserDep, db: DBConn):
+    valid_types = ("with_email", "no_email", "no_website")
+    if file_type not in valid_types:
+        raise HTTPException(400, f"file_type must be one of: {', '.join(valid_types)}")
 
     job = await db.fetchrow(
-        "SELECT status, with_web_csv, no_web_csv FROM jobs WHERE id = $1 AND user_id = $2",
-        job_id,
-        user.id,
+        "SELECT status, with_email_csv, no_email_csv, no_web_csv FROM jobs WHERE id=$1 AND user_id=$2",
+        job_id, user.id,
     )
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(404, "Job not found")
     if job["status"] != "done":
-        raise HTTPException(status_code=400, detail="Job not completed yet")
+        raise HTTPException(400, "Job not completed yet")
 
-    path = job["with_web_csv"] if file_type == "with_website" else job["no_web_csv"]
+    path_map = {
+        "with_email": job["with_email_csv"],
+        "no_email":   job["no_email_csv"],
+        "no_website": job["no_web_csv"],
+    }
+    path = path_map[file_type]
     if not path:
-        raise HTTPException(status_code=404, detail="File not available for this job")
+        raise HTTPException(404, "File not available")
 
     signed_url = await get_signed_url(path, expires_in=3600)
     return {"url": signed_url, "expires_in": 3600}
