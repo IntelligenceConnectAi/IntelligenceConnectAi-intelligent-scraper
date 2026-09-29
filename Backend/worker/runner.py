@@ -2,6 +2,7 @@
 Intelligent Scraper — Job Runner
 Uses full Chrome (channel="chrome").
 3 separate phases: Maps → Enrich → Email
+Output: 3 CSVs — with_website_with_email, with_website_no_email, no_website
 """
 
 import asyncio
@@ -39,6 +40,25 @@ ALWAYS_JUNK_DOMAINS = {
     "mailservice.com", "sentry.io", "wixpress.com",
     "squarespace.com", "wpengine.com",
 }
+
+# ── Email blacklist — supplier/chain/placeholder domains ──────
+BLACKLIST_EMAIL_DOMAINS = {
+    "doitbest.com", "ferguson.com", "famous-supply.com", "rhs1.com",
+    "menards.com", "aboutads.info", "email.com", "domain.com",
+    "rotorooter.com", "johnstonsupply.net", "usmapinformation.com",
+    "dormarhvac.com", "activeplumbing.com", "apexpros.com",
+    "mansfieldplumbing.com", "hajoca.com", "coreandmain.com",
+    "basspro.com", "winsupply.com",
+}
+
+# Exact junk emails that appear on thousands of sites
+BLACKLIST_EXACT_EMAILS = {
+    "name@email.com", "example@domain.com", "you@email.com",
+    "and@menards.com", "server@www.rhs1.com", "privacypolicy@doitbest.com",
+    "customer.support@ferguson.com", "privacy@famous-supply.com",
+    "website@www.aboutads.info",
+}
+
 LEGIT_TLDS = {
     "com","org","net","edu","gov","biz","info","co","us","ca",
     "uk","de","io","ai","app","dev","tech","store","online","site",
@@ -229,7 +249,7 @@ def format_phone(raw):
 
 def clean_address(raw):
     if not raw: return ""
-    text = raw.replace("Â·", "·").replace("Â", "").replace("\u00b7", "|")
+    text = raw.replace("Â·", "·").replace("Â", "").replace("·", "|")
     parts = re.split(r"[·|\n]", text)
     address_keywords = [
         r"\d+\s+\w", "St", "Ave", "Rd", "Blvd", "Dr", "Ln",
@@ -258,16 +278,36 @@ def clean_email(email):
     return email if "@" in email and "." in email else ""
 
 def is_valid_email(email):
+    """Validate email format AND filter blacklisted domains/emails."""
+    if not email: return False
+    email_clean = email.strip().lower()
+
+    # Masked/redacted emails
+    if "*" in email: return False
+
+    # Exact junk emails
+    if email_clean in BLACKLIST_EXACT_EMAILS: return False
+
+    # File extension false positives
     if re.search(r"\.(png|jpg|jpeg|gif|css|js|woff|svg|ico|webp|pdf|xml)$", email, re.IGNORECASE): return False
     if re.search(r"@\d+x", email): return False
     if re.search(r"(logo|img|banner|icon|avatar)", email, re.IGNORECASE): return False
+
     parts = email.split("@")
     if len(parts) != 2: return False
     local, domain = parts
-    if domain.lower() in ALWAYS_JUNK_DOMAINS: return False
-    if any(w in domain.lower() for w in ["thenumberprovided","example","test","fake","noreply"]): return False
+    domain_lower = domain.lower()
+
+    # Always-junk domains
+    if domain_lower in ALWAYS_JUNK_DOMAINS: return False
+
+    # Blacklisted supplier/chain domains
+    if domain_lower in BLACKLIST_EMAIL_DOMAINS: return False
+
+    if any(w in domain_lower for w in ["thenumberprovided","example","test","fake","noreply"]): return False
     if not is_real_tld(domain): return False
     if " " in email: return False
+
     junk_locals = ["noreply","no-reply","donotreply","do-not-reply",
                    "webmaster","postmaster","mailer-daemon","press"]
     if local.lower() in junk_locals: return False
@@ -292,6 +332,14 @@ def select_best_email(emails, website_url):
     scored = [(score_email(e, domain), e) for e in emails]
     scored.sort(key=lambda x: (-x[0], len(x[1])))
     return scored[0][1]
+
+def select_top_emails(emails, website_url, max_count=3):
+    """Return top N scored emails for a site."""
+    if not emails: return []
+    domain = urlparse(website_url).netloc.replace("www.", "")
+    scored = [(score_email(e, domain), e) for e in emails]
+    scored.sort(key=lambda x: (-x[0], len(x[1])))
+    return [e for _, e in scored[:max_count]]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -327,23 +375,21 @@ async def _scroll_to_end(page):
     """Improved scroll — waits longer and checks for end more reliably."""
     prev = 0
     stable_count = 0
-    max_stable = 8  # more attempts before giving up
+    max_stable = 8
 
     while True:
-        # Scroll feed
         await page.evaluate("""
             () => {
                 const f = document.querySelector('div[role="feed"]');
                 if (f) { f.scrollTop = f.scrollHeight; f.scrollBy(0, 5000); }
             }
         """)
-        await asyncio.sleep(1.5)  # more wait time
+        await asyncio.sleep(1.5)
 
         cur = await page.locator('div[role="feed"] > div > div[jsaction]').count()
         html = await page.content()
 
         if "You've reached the end" in html or "end of the list" in html:
-            # Extra scroll to load any final items
             for _ in range(3):
                 await page.evaluate('() => { const f = document.querySelector(\'div[role="feed"]\'); if (f) f.scrollTop = f.scrollHeight; }')
                 await asyncio.sleep(1.0)
@@ -352,7 +398,6 @@ async def _scroll_to_end(page):
         if cur == prev:
             stable_count += 1
             if stable_count >= max_stable:
-                # Final push
                 for _ in range(4):
                     await page.evaluate('() => { const f = document.querySelector(\'div[role="feed"]\'); if (f) f.scrollTop = f.scrollHeight; }')
                     await asyncio.sleep(2.0)
@@ -379,7 +424,7 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
     try:
         url = "https://www.google.com/maps/search/" + query.replace(" ", "+")
         await page.goto(url, timeout=45000, wait_until="domcontentloaded")
-        await asyncio.sleep(3)  # more initial wait
+        await asyncio.sleep(3)
 
         try:
             btn = page.locator('button:has-text("Accept all")').first
@@ -389,7 +434,7 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
 
         try:
             await page.wait_for_selector('div[role="feed"]', timeout=20000)
-            await asyncio.sleep(2)  # wait for feed to fully render
+            await asyncio.sleep(2)
         except Exception:
             title = await page.title()
             print(f"[RUNNER] Feed not found for {city}. Title: {title}")
@@ -402,8 +447,6 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
         print(f"[RUNNER] {city}: title={title}, cards_before_scroll={card_count}")
 
         await _scroll_to_end(page)
-
-        # Extra wait after scroll to ensure all cards loaded
         await asyncio.sleep(2)
         data = await page.evaluate(_EXTRACT_JS)
 
@@ -442,7 +485,72 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  PREPROCESS
+#  MERGE BY NAME — collapse same-name rows into Phone_1/2/3
+# ═══════════════════════════════════════════════════════════════
+def _merge_by_name(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Group rows by normalized business name.
+    - Collects unique phones     → Phone_1, Phone_2, Phone_3
+    - Keeps best website / Maps_URL / Address from first occurrence
+    - City aggregated in Found_In_Cities
+    - Email columns added later by _add_emails (Email_1, Email_2, Email_3)
+    """
+    df = df.copy()
+    df["Name_norm"] = df["Name"].str.lower().str.strip()
+
+    def first_nonempty(series):
+        vals = series[series.astype(str).str.strip() != ""]
+        return vals.iloc[0] if len(vals) > 0 else ""
+
+    def collect_unique(series, max_n=3):
+        seen = []
+        for v in series:
+            v = str(v).strip()
+            if v and v not in seen:
+                seen.append(v)
+            if len(seen) >= max_n:
+                break
+        return seen
+
+    rows = []
+    for name_norm, group in df.groupby("Name_norm", sort=False):
+        row = {}
+        row["Name"]          = first_nonempty(group["Name"])
+        row["Category"]      = first_nonempty(group.get("Category", pd.Series([])))
+        row["Rating"]        = first_nonempty(group.get("Rating",   pd.Series([])))
+        row["Reviews"]       = first_nonempty(group.get("Reviews",  pd.Series([])))
+        row["Address"]       = first_nonempty(group.get("Address",  pd.Series([])))
+        row["Website"]       = first_nonempty(group.get("Website",  pd.Series([])))
+        row["Maps_URL"]      = first_nonempty(group.get("Maps_URL", pd.Series([])))
+        row["Times_Found"]   = len(group)
+        cities = sorted(set(c.strip() for c in group["City"] if str(c).strip()))
+        row["Found_In_Cities"] = ", ".join(cities)
+
+        phones = collect_unique(group.get("Phone", pd.Series([])), max_n=3)
+        row["Phone_1"] = phones[0] if len(phones) > 0 else ""
+        row["Phone_2"] = phones[1] if len(phones) > 1 else ""
+        row["Phone_3"] = phones[2] if len(phones) > 2 else ""
+
+        # Email columns — filled in Phase 3
+        row["Email_1"] = ""
+        row["Email_2"] = ""
+        row["Email_3"] = ""
+
+        rows.append(row)
+
+    out_cols = [
+        "Name", "Category", "Found_In_Cities", "Times_Found",
+        "Rating", "Reviews", "Address",
+        "Phone_1", "Phone_2", "Phone_3",
+        "Email_1", "Email_2", "Email_3",
+        "Website", "Maps_URL",
+    ]
+    result = pd.DataFrame(rows)
+    return result[[c for c in out_cols if c in result.columns]]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PREPROCESS  (dedup fix applied here)
 # ═══════════════════════════════════════════════════════════════
 def _preprocess(folder_path: Path, state: str, industry: str):
     import glob
@@ -472,20 +580,15 @@ def _preprocess(folder_path: Path, state: str, industry: str):
     if "Phone"   in merged.columns: merged["Phone"]   = merged["Phone"].apply(format_phone)
     if "Address" in merged.columns: merged["Address"] = merged["Address"].apply(clean_address)
 
-    name_cities = merged.groupby("Name")["City"].apply(
-        lambda x: ", ".join(sorted(set(c.strip() for c in x if c.strip())))
-    ).to_dict()
-    name_count = merged.groupby("Name")["Name"].count().to_dict()
-    merged["Times_Found"]     = merged["Name"].map(lambda n: name_count.get(n, 1))
-    merged["Found_In_Cities"] = merged["Name"].map(lambda n: name_cities.get(n, ""))
+    # ── MERGE BY NAME — Phone_1/2/3, dedup, city aggregation ──
+    # This replaces the old has_phone/no_phone dedup logic.
+    # Same business name → one row with up to 3 unique phones collected.
+    # Case-insensitive name matching prevents duplicates like
+    # "Cyprus Electric" vs "Cyprus electric".
+    merged = _merge_by_name(merged)
 
-    has_phone = merged[merged["Phone"] != ""].copy()
-    no_phone  = merged[merged["Phone"] == ""].copy()
-    has_phone = has_phone.drop_duplicates(subset=["Name","Phone"], keep="first")
-    merged    = pd.concat([has_phone, no_phone], ignore_index=True).sort_values(["City","Name"]).reset_index(drop=True)
-
-    no_web   = merged[merged["Website"] == ""].copy()
-    with_web = merged[merged["Website"] != ""].copy()
+    no_web   = merged[merged["Website"].astype(str).str.strip() == ""].copy()
+    with_web = merged[merged["Website"].astype(str).str.strip() != ""].copy()
     return with_web, no_web
 
 
@@ -640,23 +743,34 @@ async def _crawl_site_for_email(ctx, start_url):
         all_emails.update(emails)
         if has_business_email(all_emails): break
 
-    return select_best_email(all_emails, start_url) if all_emails else ""
+    return select_top_emails(all_emails, start_url) if all_emails else []
 
 
 async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.DataFrame:
     """
     Email scraping using a BROWSER POOL.
-    Launch MAX_CONCURRENT_EMAIL browsers once — reuse them across all sites.
-    Each site gets a fresh context within a shared browser.
-    This avoids forking hundreds of Chrome processes (BlockingIOError fix).
+    - Deduplicates by Website URL: same website scraped only once, result reused.
+    - Stores up to 3 emails per business: Email_1, Email_2, Email_3.
+    - High-frequency purge: email on 3+ businesses → cleared (chain/supplier junk).
     """
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_EMAIL)
-    total     = len(df)
-    done      = [0]
     records   = df.to_dict("records")
 
+    # ── Website dedup: unique websites only ───────────────────
+    url_to_rows: dict[str, list] = {}
+    for row in records:
+        url = str(row.get("Website", "")).strip()
+        if url:
+            url_to_rows.setdefault(url, []).append(row)
+
+    unique_urls  = list(url_to_rows.keys())
+    total        = len(unique_urls)
+    done         = [0]
+    url_to_emails: dict[str, list[str]] = {}   # website → [email1, email2, email3]
+
+    print(f"[RUNNER] Email scraping: {len(records)} businesses, {total} unique websites")
+
     async with async_playwright() as p:
-        # ── Launch browser pool once ──
         browsers = []
         for _ in range(MAX_CONCURRENT_EMAIL):
             try:
@@ -682,7 +796,6 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
 
         print(f"[RUNNER] Email browser pool: {len(browsers)} browsers ready")
 
-        # Round-robin browser assignment
         browser_idx = [0]
         browser_lock = asyncio.Lock()
 
@@ -692,22 +805,18 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                 browser_idx[0] += 1
                 return b
 
-        async def process_one(row):
-            if not str(row.get("Website", "")).strip():
-                return
-            row["Email"] = ""
+        async def process_url(url):
+            """Scrape one unique website URL and store emails in url_to_emails."""
             ctx = None
             try:
                 async with semaphore:
                     browser = await get_browser()
-                    # If browser is closed, launch a new one
                     try:
                         ctx = await browser.new_context(
                             viewport={"width": 1280, "height": 900},
                             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
                         )
                     except Exception:
-                        # Browser crashed — launch fresh one
                         try:
                             new_b = await p.chromium.launch(
                                 channel="chrome", headless=True, slow_mo=0,
@@ -724,22 +833,25 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                             done[0] += 1
                             return
 
-                    row["Email"] = await asyncio.wait_for(
-                        _crawl_site_for_email(ctx, row["Website"]),
+                    emails = await asyncio.wait_for(
+                        _crawl_site_for_email(ctx, url),
                         timeout=EMAIL_CRAWL_TIMEOUT,
                     )
+                    url_to_emails[url] = emails if isinstance(emails, list) else ([emails] if emails else [])
             except asyncio.TimeoutError:
-                print(f"[RUNNER] Email timeout: {row.get('Website')}")
+                print(f"[RUNNER] Email timeout: {url}")
+                url_to_emails[url] = []
             except Exception as e:
                 print(f"[RUNNER] Email error: {type(e).__name__}")
+                url_to_emails[url] = []
             finally:
                 if ctx:
                     try: await ctx.close()
                     except: pass
                 done[0] += 1
                 if done[0] % 10 == 0 or done[0] == total:
-                    found = sum(1 for r in records if r.get("Email"))
-                    print(f"[RUNNER] Email progress: {done[0]}/{total} | found: {found}")
+                    found = sum(1 for emails in url_to_emails.values() if emails)
+                    print(f"[RUNNER] Email progress: {done[0]}/{total} sites | found: {found}")
                     try:
                         await _update_job(pool, job_id,
                                           emails_attempted=done[0],
@@ -747,23 +859,55 @@ async def _add_emails(df: pd.DataFrame, pool: asyncpg.Pool, job_id: str) -> pd.D
                     except Exception as e:
                         print(f"[RUNNER] DB update error: {e}")
 
-        async def safe_process(r):
+        async def safe_process(url):
             try:
-                await process_one(r)
+                await process_url(url)
             except Exception as e:
                 print(f"[RUNNER] Task error: {e}")
 
         await asyncio.gather(
-            *[safe_process(r) for r in records if str(r.get("Website","")).strip()],
+            *[safe_process(url) for url in unique_urls],
             return_exceptions=True,
         )
 
-        # Close all browsers
         for b in browsers:
             try: await b.close()
             except: pass
 
-    return pd.DataFrame(records)
+    # ── Apply scraped emails back to each row (Email_1/2/3) ───
+    for row in records:
+        url    = str(row.get("Website", "")).strip()
+        emails = url_to_emails.get(url, [])
+        row["Email_1"] = emails[0] if len(emails) > 0 else ""
+        row["Email_2"] = emails[1] if len(emails) > 1 else ""
+        row["Email_3"] = emails[2] if len(emails) > 2 else ""
+
+    # ── POST-EMAIL CLEANUP: high-frequency purge across all columns ─
+    # Same email appearing on 3+ different businesses = supplier/chain junk
+    result_df = pd.DataFrame(records)
+    all_email_vals = pd.concat([
+        result_df["Email_1"].str.lower(),
+        result_df["Email_2"].str.lower(),
+        result_df["Email_3"].str.lower(),
+    ]).str.strip()
+    all_email_vals = all_email_vals[all_email_vals != ""]
+    email_freq  = all_email_vals.value_counts()
+    spam_emails = set(email_freq[email_freq >= 3].index)
+    if spam_emails:
+        print(f"[RUNNER] Removing {len(spam_emails)} high-frequency junk emails")
+        for col in ["Email_1", "Email_2", "Email_3"]:
+            result_df.loc[result_df[col].str.lower().isin(spam_emails), col] = ""
+
+    # Shift emails left if Email_1 was cleared (so Email_2 becomes Email_1, etc.)
+    def shift_emails(row):
+        emails = [e for e in [row["Email_1"], row["Email_2"], row["Email_3"]] if e.strip()]
+        row["Email_1"] = emails[0] if len(emails) > 0 else ""
+        row["Email_2"] = emails[1] if len(emails) > 1 else ""
+        row["Email_3"] = emails[2] if len(emails) > 2 else ""
+        return row
+
+    result_df = result_df.apply(shift_emails, axis=1)
+    return result_df
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -832,32 +976,44 @@ async def run_scrape_job(
             with_web_df = await _add_emails(with_web_df, pool, job_id)
             await _update_job(pool, job_id, emails_done_at="NOW()")
 
-        # ── UPLOAD CSVs ──
-        with_web_path = f"{user_id}/{job_id}/with_website.csv"
-        no_web_path   = f"{user_id}/{job_id}/no_website.csv"
+        # ── SPLIT: with_email vs no_email ──────────────────────
+        # A business "has email" if at least Email_1 is populated
+        has_email_col = with_web_df["Email_1"].astype(str).str.strip() != ""
+        with_email_df = with_web_df[has_email_col].copy()
+        no_email_df   = with_web_df[~has_email_col].copy()
+
+        print(f"[RUNNER] Split: with_email={len(with_email_df)}, no_email={len(no_email_df)}, no_website={len(no_web_df)}")
+
+        # ── UPLOAD 3 CSVs ──────────────────────────────────────
+        with_email_path = f"{user_id}/{job_id}/with_website_with_email.csv"
+        no_email_path   = f"{user_id}/{job_id}/with_website_no_email.csv"
+        no_web_path     = f"{user_id}/{job_id}/no_website.csv"
 
         def df_to_bytes(df: pd.DataFrame) -> bytes:
             buf = io.StringIO()
             df.to_csv(buf, index=False, encoding="utf-8")
             return buf.getvalue().encode("utf-8")
 
-        await upload_fn(df_to_bytes(with_web_df), with_web_path)
-        await upload_fn(df_to_bytes(no_web_df),   no_web_path)
+        await upload_fn(df_to_bytes(with_email_df), with_email_path)
+        await upload_fn(df_to_bytes(no_email_df),   no_email_path)
+        await upload_fn(df_to_bytes(no_web_df),      no_web_path)
 
-        emails_found = int(with_web_df["Email"].astype(str).str.strip().ne("").sum()) if not with_web_df.empty else 0
+        emails_found = int(has_email_col.sum())
 
         await _update_job(pool, job_id,
                           status="done",
                           current_step="complete",
                           emails_found=emails_found,
-                          with_web_csv=with_web_path,
+                          with_email_csv=with_email_path,
+                          no_email_csv=no_email_path,
                           no_web_csv=no_web_path,
                           completed_at="NOW()")
 
         return {
-            "total_raw":    total_raw,
-            "total_clean":  total_clean,
-            "with_website": len(with_web_df),
-            "no_website":   len(no_web_df),
-            "emails_found": emails_found,
+            "total_raw":      total_raw,
+            "total_clean":    total_clean,
+            "with_email":     len(with_email_df),
+            "no_email":       len(no_email_df),
+            "no_website":     len(no_web_df),
+            "emails_found":   emails_found,
         }
