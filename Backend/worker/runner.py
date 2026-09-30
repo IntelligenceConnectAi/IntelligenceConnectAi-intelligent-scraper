@@ -49,6 +49,10 @@ BLACKLIST_EMAIL_DOMAINS = {
     "dormarhvac.com", "activeplumbing.com", "apexpros.com",
     "mansfieldplumbing.com", "hajoca.com", "coreandmain.com",
     "basspro.com", "winsupply.com",
+    # Added: franchise/chain/utility/privacy junk
+    "authoritybrandsllc.com", "authoritybrands.co", "authoritybrands.com",
+    "wm.com", "cityelectricsupply.com", "cef.co.uk", "ssvec.org",
+    "aps.com", "demandproelectric.com", "electricaltitude.com",
 }
 
 # Exact junk emails that appear on thousands of sites
@@ -311,6 +315,13 @@ def is_valid_email(email):
     junk_locals = ["noreply","no-reply","donotreply","do-not-reply",
                    "webmaster","postmaster","mailer-daemon","press"]
     if local.lower() in junk_locals: return False
+
+    # Block "website@www.*" and "online@www.*" — CMS auto-generated junk
+    if local.lower() in ("website", "online") and domain_lower.startswith("www."): return False
+
+    # Block "privacyofficer@*" and "gdprteam@*"
+    if re.match(r"^(privacyofficer|gdprteam|privacy\.officer|dpo)$", local.lower()): return False
+
     return True
 
 def score_email(email, website_domain):
@@ -546,6 +557,118 @@ def _merge_by_name(df: pd.DataFrame) -> pd.DataFrame:
         "Website", "Maps_URL",
     ]
     result = pd.DataFrame(rows)
+    result = result[[c for c in out_cols if c in result.columns]]
+
+    # ── Second pass: merge rows that share same Website or Phone_1 ──
+    result = _merge_by_website_or_phone(result)
+
+    return result
+
+
+def _merge_by_website_or_phone(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    After name-merge, collapse rows that share the same non-empty Website
+    OR the same non-empty Phone_1. Uses Union-Find to group connected rows.
+    Phones from all rows are merged into Phone_1/2/3.
+    Longest name is kept. Cities are combined.
+    """
+    n = len(df)
+    if n == 0:
+        return df
+
+    df = df.reset_index(drop=True)
+
+    # Union-Find
+    parent = list(range(n))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        a, b = find(a), find(b)
+        if a != b:
+            parent[b] = a
+
+    # Index by website
+    web_idx: dict[str, int] = {}
+    for i, row in df.iterrows():
+        w = str(row.get("Website", "")).strip().lower().rstrip("/")
+        if w and w != "nan":
+            if w in web_idx:
+                union(i, web_idx[w])
+            else:
+                web_idx[w] = i
+
+    # Index by Phone_1
+    ph_idx: dict[str, int] = {}
+    for i, row in df.iterrows():
+        p = str(row.get("Phone_1", "")).strip()
+        if p and p.lower() != "nan":
+            if p in ph_idx:
+                union(i, ph_idx[p])
+            else:
+                ph_idx[p] = i
+
+    # Group by root
+    from collections import defaultdict
+    groups: dict[int, list[int]] = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(i)
+
+    def collect_unique(vals, max_n=3):
+        seen = []
+        for v in vals:
+            v = str(v).strip()
+            if v and v not in seen:
+                seen.append(v)
+            if len(seen) >= max_n:
+                break
+        return seen
+
+    merged_rows = []
+    for root, idxs in groups.items():
+        group = df.iloc[idxs]
+        row = {}
+        # Pick longest name
+        names = group["Name"].tolist()
+        row["Name"] = max(names, key=len) if names else ""
+        row["Category"]  = group["Category"].iloc[0]
+        row["Rating"]    = group["Rating"].iloc[0]
+        row["Reviews"]   = group["Reviews"].iloc[0]
+        row["Address"]   = next((v for v in group["Address"] if str(v).strip()), "")
+        row["Website"]   = next((v for v in group["Website"] if str(v).strip()), "")
+        row["Maps_URL"]  = next((v for v in group["Maps_URL"] if str(v).strip()), "")
+        row["Times_Found"] = int(group["Times_Found"].sum())
+        cities = sorted(set(
+            c.strip()
+            for cell in group["Found_In_Cities"]
+            for c in str(cell).split(",")
+            if c.strip()
+        ))
+        row["Found_In_Cities"] = ", ".join(cities)
+
+        all_phones = []
+        for col in ["Phone_1", "Phone_2", "Phone_3"]:
+            if col in group.columns:
+                all_phones.extend(group[col].tolist())
+        phones = collect_unique(all_phones, max_n=3)
+        row["Phone_1"] = phones[0] if len(phones) > 0 else ""
+        row["Phone_2"] = phones[1] if len(phones) > 1 else ""
+        row["Phone_3"] = phones[2] if len(phones) > 2 else ""
+        row["Email_1"] = ""
+        row["Email_2"] = ""
+        row["Email_3"] = ""
+        merged_rows.append(row)
+
+    out_cols = [
+        "Name", "Category", "Found_In_Cities", "Times_Found",
+        "Rating", "Reviews", "Address",
+        "Phone_1", "Phone_2", "Phone_3",
+        "Email_1", "Email_2", "Email_3",
+        "Website", "Maps_URL",
+    ]
+    result = pd.DataFrame(merged_rows)
     return result[[c for c in out_cols if c in result.columns]]
 
 
@@ -597,7 +720,7 @@ def _preprocess(folder_path: Path, state: str, industry: str):
 # ═══════════════════════════════════════════════════════════════
 async def _enrich_missing(records: list, pool: asyncpg.Pool, job_id: str) -> list:
     missing = [r for r in records if
-               (not str(r.get("Website","")).strip() or not str(r.get("Phone","")).strip())
+               (not str(r.get("Website","")).strip() or not str(r.get("Phone_1","")).strip())
                and str(r.get("Maps_URL","")).strip()]
 
     if not missing:
@@ -624,8 +747,8 @@ async def _enrich_missing(records: list, pool: asyncpg.Pool, job_id: str) -> lis
                     data = await page.evaluate(_DETAIL_JS)
                     if data.get("website") and not str(row.get("Website","")).strip():
                         row["Website"] = data["website"]
-                    if data.get("phone") and not str(row.get("Phone","")).strip():
-                        row["Phone"] = format_phone(data["phone"])
+                    if data.get("phone") and not str(row.get("Phone_1","")).strip():
+                        row["Phone_1"] = format_phone(data["phone"])
                 except Exception as e:
                     pass
                 finally:
@@ -959,7 +1082,7 @@ async def run_scrape_job(
                           duplicates_removed=max(total_raw - total_clean, 0))
 
         # ── PHASE 2: Detail Enrichment ──
-        if not no_web_df.empty or (not with_web_df.empty and with_web_df["Phone"].eq("").any()):
+        if not no_web_df.empty or (not with_web_df.empty and with_web_df["Phone_1"].eq("").any()):
             await _update_job(pool, job_id, current_step="step2_enrich")
             all_records = pd.concat([with_web_df, no_web_df], ignore_index=True).to_dict("records")
             all_records = await _enrich_missing(all_records, pool, job_id)
