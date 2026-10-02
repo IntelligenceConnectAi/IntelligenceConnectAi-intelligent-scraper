@@ -160,6 +160,68 @@ async def test_plan_change_updates_subscription_and_defaults_to_active_status(
     assert resp.json()["plan_name"] == "Growth"
 
 
+async def test_plan_change_sets_period_end_for_a_brand_new_subscription_row(
+    client, db_conn, auth_user_pool, make_headers,
+):
+    """Regression test: an org with no subscriptions row at all previously got one
+    with current_period_end left NULL forever, which silently broke every feature
+    keyed off the billing-period window (People Leads' monthly limit, the
+    dashboard's usage display, and the additional-records topup checkout, which
+    refuses to purchase against an undefined period)."""
+    from tests.factories import make_org
+    super_admin = auth_user_pool[0]
+    await make_admin(db_conn, super_admin, platform_role="super_admin")
+
+    owner = auth_user_pool[1]
+    owner_id = await make_user(db_conn, owner["id"], owner["email"])
+    org_id = await make_org(db_conn, owner_id)  # no subscriptions row yet
+
+    resp = await client.patch(
+        f"/admin/clients/{org_id}/plan", json={"plan_id": "starter"}, headers=make_headers(super_admin)
+    )
+    assert resp.status_code == 200
+
+    row = await db_conn.fetchrow("SELECT current_period_end FROM subscriptions WHERE user_id = $1", owner_id)
+    assert row["current_period_end"] is not None
+
+
+async def test_plan_change_backfills_null_period_end_without_clobbering_a_real_one(
+    client, db_conn, auth_user_pool, make_headers,
+):
+    from datetime import datetime, timezone
+    super_admin = auth_user_pool[0]
+    await make_admin(db_conn, super_admin, platform_role="super_admin")
+
+    # Case 1: a subscription already corrupted with a NULL period (simulates the
+    # pre-fix bug's existing fallout) gets backfilled, not left NULL.
+    broken_owner = auth_user_pool[1]
+    broken_owner_id, broken_org_id = await make_client(db_conn, broken_owner, plan_id="starter")
+    await db_conn.execute("UPDATE subscriptions SET current_period_end = NULL WHERE user_id = $1", broken_owner_id)
+
+    resp = await client.patch(
+        f"/admin/clients/{broken_org_id}/plan", json={"plan_id": "pro"}, headers=make_headers(super_admin)
+    )
+    assert resp.status_code == 200
+    row = await db_conn.fetchrow("SELECT current_period_end FROM subscriptions WHERE user_id = $1", broken_owner_id)
+    assert row["current_period_end"] is not None
+
+    # Case 2: an org with a real (e.g. Stripe-sourced) period already set must not
+    # have it silently reset by an unrelated manual plan tweak.
+    healthy_owner = auth_user_pool[2]
+    healthy_owner_id, healthy_org_id = await make_client(db_conn, healthy_owner, plan_id="starter")
+    fixed_period_end = datetime(2027, 1, 1, tzinfo=timezone.utc)
+    await db_conn.execute(
+        "UPDATE subscriptions SET current_period_end = $2 WHERE user_id = $1", healthy_owner_id, fixed_period_end
+    )
+
+    resp2 = await client.patch(
+        f"/admin/clients/{healthy_org_id}/plan", json={"plan_id": "pro"}, headers=make_headers(super_admin)
+    )
+    assert resp2.status_code == 200
+    row2 = await db_conn.fetchrow("SELECT current_period_end FROM subscriptions WHERE user_id = $1", healthy_owner_id)
+    assert row2["current_period_end"] == fixed_period_end
+
+
 async def test_plan_change_rejects_unknown_plan_id(client, db_conn, auth_user_pool, make_headers):
     super_admin = auth_user_pool[0]
     await make_admin(db_conn, super_admin, platform_role="super_admin")

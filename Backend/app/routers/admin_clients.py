@@ -221,9 +221,18 @@ async def update_client_plan(
 
     await db.execute(
         """
-        INSERT INTO subscriptions (user_id, plan_id, status)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (user_id) DO UPDATE SET plan_id = EXCLUDED.plan_id, status = EXCLUDED.status, updated_at = NOW()
+        INSERT INTO subscriptions (user_id, plan_id, status, current_period_end)
+        VALUES ($1, $2, $3, NOW() + INTERVAL '30 days')
+        ON CONFLICT (user_id) DO UPDATE SET
+            plan_id = EXCLUDED.plan_id,
+            status = EXCLUDED.status,
+            -- Only fill in a period when one is genuinely missing (a subscriptions
+            -- row this endpoint is creating for the first time, or one left NULL by
+            -- an earlier bug) -- never clobber a real Stripe-sourced period that's
+            -- already set, since this endpoint has no way to know the true cycle
+            -- boundary once Stripe owns it.
+            current_period_end = COALESCE(subscriptions.current_period_end, EXCLUDED.current_period_end),
+            updated_at = NOW()
         """,
         owner_id, body.plan_id, body.status,
     )

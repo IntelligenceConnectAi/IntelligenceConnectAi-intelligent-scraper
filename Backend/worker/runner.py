@@ -274,6 +274,19 @@ def format_phone(raw):
         return f"+1 {digits[:3]}-{digits[3:6]}-{digits[6:]}"
     return raw.strip()
 
+def normalize_website(raw):
+    """For COMPARISON only -- the original, unmodified Website string is still
+    what gets stored/shown. Strips protocol/www/trailing-slash/query/fragment so
+    'https://Acme.com/' and 'http://www.acme.com' compare equal. Deliberately
+    keeps the path (never collapses to domain-only) -- two different location
+    pages on one franchise's root domain are still different businesses."""
+    if not raw: return ""
+    url = raw.strip().lower()
+    url = re.sub(r"^https?://", "", url)
+    url = re.sub(r"^www\.", "", url)
+    url = url.split("?")[0].split("#")[0].rstrip("/")
+    return url
+
 def clean_address(raw):
     if not raw: return ""
     text = raw.replace("Â·", "·").replace("Â", "").replace("\u00b7", "|")
@@ -543,6 +556,138 @@ async def _scrape_city(city, state, industry, browser, out_dir, pool, job_id):
 # ═══════════════════════════════════════════════════════════════
 #  PREPROCESS
 # ═══════════════════════════════════════════════════════════════
+FINAL_BUSINESS_COLS = [
+    "Name", "Category", "City", "Rating", "Reviews", "Address",
+    "Phone", "Phone 2", "Email", "Website", "Website 2", "Maps_URL",
+    "Times_Found", "Found_In_Cities",
+]
+
+
+def _merge_duplicate_businesses(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapses rows that are the same real-world business into one, using
+    Phone and/or Website as identity (NOT Name -- the same business re-listed
+    under a different name must still merge). Two rows are connected if they
+    share any non-empty, normalized Phone or Website value; connections are
+    transitive (union-find), so a 3-row chain merges into one business even if
+    no two of the three rows directly share a value with each other.
+
+    Checks BOTH the primary and the " 2" column (if present) when building
+    connections -- this makes the function safe to call a second time on data
+    that's already been through one merge pass (see run_scrape_job's Phase 2
+    call site), correctly catching matches that only became visible after
+    enrichment filled in a previously-blank Phone/Website.
+
+    The merged row keeps the first-found row's other fields (Name/Category/
+    City/Rating/Reviews/Address/Maps_URL/Email) and aggregates Times_Found/
+    Found_In_Cities across every row in the group. Up to 2 distinct phones and
+    2 distinct websites survive (Phone/Phone 2, Website/Website 2); a 3rd+
+    distinct value is dropped. Rows with neither a phone nor a website can't
+    be matched to anything and pass through unmerged."""
+    if df.empty:
+        return df
+
+    df = df.reset_index(drop=True)
+    n = len(df)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    def _row_pairs(idx, primary_col, secondary_col, normalize):
+        """(raw, normalized) for every non-empty value in idx's primary/secondary
+        column -- checking BOTH is what makes this function safe to call again on
+        data that already carries a " 2" value from an earlier merge pass."""
+        pairs = []
+        for col in (primary_col, secondary_col):
+            if col in df.columns:
+                raw = str(df.at[idx, col] or "").strip()
+                if raw:
+                    pairs.append((raw, normalize(raw)))
+        return pairs
+
+    groups: dict[tuple[str, str], list[int]] = {}
+    for idx in range(n):
+        for _, norm in _row_pairs(idx, "Phone", "Phone 2", lambda p: p):
+            groups.setdefault(("phone", norm), []).append(idx)
+        for _, norm in _row_pairs(idx, "Website", "Website 2", normalize_website):
+            groups.setdefault(("website", norm), []).append(idx)
+
+    for members in groups.values():
+        for idx in members[1:]:
+            union(members[0], idx)
+
+    components: dict[int, list[int]] = {}
+    for idx in range(n):
+        components.setdefault(find(idx), []).append(idx)
+
+    def _distinct_values(indices, primary_col, secondary_col, normalize):
+        """Up to all distinct values (by normalized form) across every member
+        row's primary AND secondary column, first-seen order, original text kept."""
+        out, seen = [], set()
+        for i in indices:
+            for raw, norm in _row_pairs(i, primary_col, secondary_col, normalize):
+                if norm not in seen:
+                    seen.add(norm)
+                    out.append(raw)
+        return out
+
+    merged_rows = []
+    for indices in components.values():
+        base = df.loc[indices[0]].to_dict()
+
+        # Aggregate from BOTH a plain City value and any pre-existing
+        # Found_In_Cities list -- a member row may itself already be the
+        # output of an earlier merge pass, in which case its real city history
+        # lives in Found_In_Cities, not its (single, first-found) City field.
+        if "City" in df.columns or "Found_In_Cities" in df.columns:
+            cities = set()
+            for i in indices:
+                if "Found_In_Cities" in df.columns:
+                    existing = str(df.at[i, "Found_In_Cities"] or "").strip()
+                    if existing:
+                        cities.update(c.strip() for c in existing.split(",") if c.strip())
+                if "City" in df.columns:
+                    c = str(df.at[i, "City"] or "").strip()
+                    if c:
+                        cities.add(c)
+            base["Found_In_Cities"] = ", ".join(sorted(cities))
+
+        # Sum rather than count indices -- a member row may already represent
+        # several original rows merged in an earlier pass (its own Times_Found).
+        if "Times_Found" in df.columns:
+            base["Times_Found"] = sum(
+                int(df.at[i, "Times_Found"]) if str(df.at[i, "Times_Found"]).strip() else 1
+                for i in indices
+            )
+        else:
+            base["Times_Found"] = len(indices)
+
+        phones = _distinct_values(indices, "Phone", "Phone 2", lambda p: p)
+        base["Phone"]   = phones[0] if len(phones) > 0 else ""
+        base["Phone 2"] = phones[1] if len(phones) > 1 else ""
+
+        websites = _distinct_values(indices, "Website", "Website 2", normalize_website)
+        base["Website"]   = websites[0] if len(websites) > 0 else ""
+        base["Website 2"] = websites[1] if len(websites) > 1 else ""
+
+        merged_rows.append(base)
+
+    result = pd.DataFrame(merged_rows)
+    result = result[[c for c in FINAL_BUSINESS_COLS if c in result.columns]]
+    sort_cols = [c for c in ["City", "Name"] if c in result.columns]
+    if sort_cols:
+        result = result.sort_values(sort_cols).reset_index(drop=True)
+    return result
+
+
 def _preprocess(folder_path: Path, state: str, industry: str):
     import glob
     all_files = glob.glob(str(folder_path / "*.csv"))
@@ -571,17 +716,7 @@ def _preprocess(folder_path: Path, state: str, industry: str):
     if "Phone"   in merged.columns: merged["Phone"]   = merged["Phone"].apply(format_phone)
     if "Address" in merged.columns: merged["Address"] = merged["Address"].apply(clean_address)
 
-    name_cities = merged.groupby("Name")["City"].apply(
-        lambda x: ", ".join(sorted(set(c.strip() for c in x if c.strip())))
-    ).to_dict()
-    name_count = merged.groupby("Name")["Name"].count().to_dict()
-    merged["Times_Found"]     = merged["Name"].map(lambda n: name_count.get(n, 1))
-    merged["Found_In_Cities"] = merged["Name"].map(lambda n: name_cities.get(n, ""))
-
-    has_phone = merged[merged["Phone"] != ""].copy()
-    no_phone  = merged[merged["Phone"] == ""].copy()
-    has_phone = has_phone.drop_duplicates(subset=["Name","Phone"], keep="first")
-    merged    = pd.concat([has_phone, no_phone], ignore_index=True).sort_values(["City","Name"]).reset_index(drop=True)
+    merged = _merge_duplicate_businesses(merged)
 
     no_web   = merged[merged["Website"] == ""].copy()
     with_web = merged[merged["Website"] != ""].copy()
@@ -1324,10 +1459,19 @@ async def run_scrape_job(
                 all_records = pd.concat([with_web_df, no_web_df], ignore_index=True).to_dict("records")
                 all_records = await _enrich_missing(all_records, pool, job_id, claim_token)
                 all_df      = pd.DataFrame(all_records)
+                # Catches matches enrichment just discovered -- two rows with no
+                # phone/website at Phase 1 can end up sharing one after this step
+                # fills in a previously-blank field. Safe to re-run: it checks both
+                # the primary and " 2" columns, so nothing from the first pass is
+                # lost or double-counted.
+                all_df      = _merge_duplicate_businesses(all_df)
                 with_web_df, no_web_df = _split_by_website(all_df)
+                total_clean = len(all_df)
                 await _update_job(pool, job_id,
+                                  total_clean=total_clean,
                                   with_website=len(with_web_df),
-                                  no_website=len(no_web_df))
+                                  no_website=len(no_web_df),
+                                  duplicates_removed=max(total_raw - total_clean, 0))
 
             # Checkpoint: enrichment is done (or wasn't needed) — a retry from here
             # on will skip Maps AND enrichment and go straight to email scraping.
@@ -1359,8 +1503,13 @@ async def run_scrape_job(
         no_web_path   = f"{user_id}/{job_id}/no_website.csv"
 
         def df_to_bytes(df: pd.DataFrame) -> bytes:
+            # Times_Found/Found_In_Cities stay in the working dataframes -- the
+            # merge logic itself relies on them (see _merge_duplicate_businesses,
+            # called a second time after Phase 2 enrichment, which aggregates
+            # counts/cities from the first pass). Only hidden from the delivered
+            # CSV, not removed from tracking.
             buf = io.StringIO()
-            df.to_csv(buf, index=False, encoding="utf-8")
+            df.drop(columns=["Times_Found", "Found_In_Cities"], errors="ignore").to_csv(buf, index=False, encoding="utf-8")
             return buf.getvalue().encode("utf-8")
 
         await upload_fn(df_to_bytes(with_web_df), with_web_path)
