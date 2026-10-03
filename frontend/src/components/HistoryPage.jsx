@@ -59,13 +59,19 @@ export default function HistoryPage({ onNavigate, theme }) {
     setDl(p => ({ ...p, [entry.id]: true }));
     try {
       if (entry.source_type === "business") {
-        try {
-          const r = await api.downloadJob(entry.id, "with_website");
-          window.open(r.url, "_blank");
-        } catch {
-          const r = await api.downloadJob(entry.id, "no_website");
-          window.open(r.url, "_blank");
+        // Try newest-first: with-email, then without-email, then no-website --
+        // whichever file actually exists for this job's completion date.
+        const fileTypes = ["with_website_with_email", "with_website_without_email", "no_website"];
+        let opened = false;
+        for (const fileType of fileTypes) {
+          try {
+            const r = await api.downloadJob(entry.id, fileType);
+            window.open(r.url, "_blank");
+            opened = true;
+            break;
+          } catch { /* try the next file type */ }
         }
+        if (!opened) throw new Error("No file available for this job");
       } else {
         const detail = await api.getPeopleLeadRequest(entry.id);
         if (detail.download_url) window.open(detail.download_url, "_blank");

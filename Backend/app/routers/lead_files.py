@@ -29,7 +29,10 @@ from app.storage import get_signed_url
 router = APIRouter()
 
 VALID_SOURCE_TYPES = {"business", "people"}
-VALID_CATEGORIES = {"business_with_website", "business_no_website", "people_leads"}
+VALID_CATEGORIES = {
+    "business_with_website", "business_no_website", "people_leads",
+    "business_with_website_email", "business_with_website_no_email",
+}
 
 _SELECT_JOINED = """
     SELECT lf.*,

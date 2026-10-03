@@ -7,6 +7,8 @@ import BarListChart from "./charts/BarListChart";
 const CATEGORY_LABELS = {
   business_with_website: "With Website",
   business_no_website: "Without Website",
+  business_with_website_email: "With Email",
+  business_with_website_no_email: "Without Email",
   people_leads: "People Leads",
 };
 
@@ -201,6 +203,8 @@ export default function MyLeads({ onNavigate, theme }) {
               <option value="">All</option>
               <option value="business_with_website">With Website</option>
               <option value="business_no_website">Without Website</option>
+              <option value="business_with_website_email">With Email</option>
+              <option value="business_with_website_no_email">Without Email</option>
               <option value="people_leads">People Leads</option>
             </select>
           </div>

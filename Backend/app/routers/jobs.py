@@ -247,8 +247,19 @@ async def cancel_job(job_id: UUID, user: CurrentUserDep, db: DBConn):
 
 # ─────────────────────────────────────────────────────
 #  GET /jobs/{job_id}/download/{file_type}
-#  file_type: "with_website" or "no_website"
+#  file_type -> (DB column, filename suffix). "with_website" is legacy -- only
+#  populated on jobs completed before the with-email/without-email split
+#  shipped (migrations/0013_split_with_website_by_email.sql); kept accepted
+#  forever so old jobs' downloads never break.
 # ─────────────────────────────────────────────────────
+FILE_TYPE_COLUMNS = {
+    "with_website": ("with_web_csv", "with_website"),
+    "no_website": ("no_web_csv", "without_website"),
+    "with_website_with_email": ("with_web_email_csv", "with_website_with_email"),
+    "with_website_without_email": ("with_web_no_email_csv", "with_website_without_email"),
+}
+
+
 @router.get("/{job_id}/download/{file_type}")
 async def download_job(
     job_id: UUID,
@@ -256,11 +267,12 @@ async def download_job(
     user: CurrentUserDep,
     db: DBConn,
 ):
-    if file_type not in ("with_website", "no_website"):
-        raise HTTPException(status_code=400, detail="file_type must be 'with_website' or 'no_website'")
+    if file_type not in FILE_TYPE_COLUMNS:
+        raise HTTPException(status_code=400, detail=f"file_type must be one of: {', '.join(FILE_TYPE_COLUMNS)}")
 
+    columns = ", ".join(sorted({col for col, _ in FILE_TYPE_COLUMNS.values()}))
     job = await db.fetchrow(
-        "SELECT status, industry, state, with_web_csv, no_web_csv FROM jobs WHERE id = $1 AND user_id = $2",
+        f"SELECT status, industry, state, {columns} FROM jobs WHERE id = $1 AND user_id = $2",
         job_id,
         user.id,
     )
@@ -269,11 +281,11 @@ async def download_job(
     if job["status"] != "done":
         raise HTTPException(status_code=400, detail="Job not completed yet")
 
-    path = job["with_web_csv"] if file_type == "with_website" else job["no_web_csv"]
+    column, suffix = FILE_TYPE_COLUMNS[file_type]
+    path = job[column]
     if not path:
         raise HTTPException(status_code=404, detail="File not available for this job")
 
-    suffix = "with_website" if file_type == "with_website" else "without_website"
     filename = safe_filename(f"{job['industry']}_{job['state']}_{suffix}.csv")
     signed_url = await get_signed_url(path, expires_in=3600, download_filename=filename)
     return {"url": signed_url, "expires_in": 3600}

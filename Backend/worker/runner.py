@@ -1499,8 +1499,13 @@ async def run_scrape_job(
             }
 
         # ── UPLOAD CSVs ──
-        with_web_path = f"{user_id}/{job_id}/with_website.csv"
-        no_web_path   = f"{user_id}/{job_id}/no_website.csv"
+        # "With website" is split into two deliverables (email found / not found)
+        # instead of one combined file -- with_web_csv itself is deliberately left
+        # unset on new jobs; it's legacy, still serving only jobs completed before
+        # this split shipped (see migrations/0013_split_with_website_by_email.sql).
+        with_web_email_path    = f"{user_id}/{job_id}/with_website_with_email.csv"
+        with_web_no_email_path = f"{user_id}/{job_id}/with_website_without_email.csv"
+        no_web_path             = f"{user_id}/{job_id}/no_website.csv"
 
         def df_to_bytes(df: pd.DataFrame) -> bytes:
             # Times_Found/Found_In_Cities stay in the working dataframes -- the
@@ -1512,16 +1517,24 @@ async def run_scrape_job(
             df.drop(columns=["Times_Found", "Found_In_Cities"], errors="ignore").to_csv(buf, index=False, encoding="utf-8")
             return buf.getvalue().encode("utf-8")
 
-        await upload_fn(df_to_bytes(with_web_df), with_web_path)
-        await upload_fn(df_to_bytes(no_web_df),   no_web_path)
+        if with_web_df.empty:
+            with_email_df, without_email_df = with_web_df, with_web_df
+        else:
+            has_email = with_web_df["Email"].astype(str).str.strip().ne("")
+            with_email_df, without_email_df = with_web_df[has_email].copy(), with_web_df[~has_email].copy()
 
-        emails_found = int(with_web_df["Email"].astype(str).str.strip().ne("").sum()) if not with_web_df.empty else 0
+        await upload_fn(df_to_bytes(with_email_df),    with_web_email_path)
+        await upload_fn(df_to_bytes(without_email_df), with_web_no_email_path)
+        await upload_fn(df_to_bytes(no_web_df),        no_web_path)
+
+        emails_found = len(with_email_df)
 
         await _update_job(pool, job_id,
                           status="done",
                           current_step="complete",
                           emails_found=emails_found,
-                          with_web_csv=with_web_path,
+                          with_web_email_csv=with_web_email_path,
+                          with_web_no_email_csv=with_web_no_email_path,
                           no_web_csv=no_web_path,
                           completed_at="NOW()")
 

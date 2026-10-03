@@ -74,10 +74,15 @@ export default function RequestsTable({ jobs, emptyLabel = "No requests yet", em
                 <td className="px-4 py-3">
                   {job.status === "Completed" ? (
                     <div className="flex gap-1.5">
-                      <button onClick={() => download(job.id, "with_website")}
-                        disabled={dl[`${job.id}-with_website`]}
+                      <button onClick={() => download(job.id, "with_website_with_email")}
+                        disabled={dl[`${job.id}-with_website_with_email`]}
                         className="badge badge-accent cursor-pointer hover:opacity-80 transition disabled:opacity-40">
-                        {dl[`${job.id}-with_website`] ? "…" : "⬇ Web"}
+                        {dl[`${job.id}-with_website_with_email`] ? "…" : "⬇ Email"}
+                      </button>
+                      <button onClick={() => download(job.id, "with_website_without_email")}
+                        disabled={dl[`${job.id}-with_website_without_email`]}
+                        className="badge badge-muted cursor-pointer hover:opacity-80 transition disabled:opacity-40">
+                        {dl[`${job.id}-with_website_without_email`] ? "…" : "⬇ No email"}
                       </button>
                       <button onClick={() => download(job.id, "no_website")}
                         disabled={dl[`${job.id}-no_website`]}
@@ -111,8 +116,9 @@ export default function RequestsTable({ jobs, emptyLabel = "No requests yet", em
             </div>
             {job.status === "Completed" && (
               <div className="flex gap-2">
-                <button onClick={() => download(job.id, "with_website")} className="badge badge-accent cursor-pointer">⬇ With website</button>
-                <button onClick={() => download(job.id, "no_website")}   className="badge badge-muted cursor-pointer">⬇ No website</button>
+                <button onClick={() => download(job.id, "with_website_with_email")}    className="badge badge-accent cursor-pointer">⬇ With email</button>
+                <button onClick={() => download(job.id, "with_website_without_email")} className="badge badge-muted cursor-pointer">⬇ No email</button>
+                <button onClick={() => download(job.id, "no_website")}                 className="badge badge-muted cursor-pointer">⬇ No website</button>
               </div>
             )}
           </div>

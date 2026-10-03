@@ -101,8 +101,11 @@ export function JobProgress({ jobId, onNewJob }) {
       <div className="flex flex-wrap gap-2">
         {isComplete && (
           <>
-            <button onClick={() => download("with_website")} className="btn-primary">
-              ⬇ With Website
+            <button onClick={() => download("with_website_with_email")} className="btn-primary">
+              ⬇ With Email
+            </button>
+            <button onClick={() => download("with_website_without_email")} className="btn-ghost">
+              ⬇ Without Email
             </button>
             <button onClick={() => download("no_website")} className="btn-ghost">
               ⬇ No Website

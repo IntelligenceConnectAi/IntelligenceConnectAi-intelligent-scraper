@@ -16,6 +16,7 @@ async def index_business_job_files(conn: asyncpg.Connection, *, job_id) -> None:
     job = await conn.fetchrow(
         """
         SELECT id, user_id, industry, state, status, with_web_csv, no_web_csv,
+               with_web_email_csv, with_web_no_email_csv,
                with_website, no_website, emails_found
         FROM jobs WHERE id = $1
         """,
@@ -26,6 +27,8 @@ async def index_business_job_files(conn: asyncpg.Connection, *, job_id) -> None:
 
     org_id = await get_current_org_id(conn, job["user_id"])
 
+    # Legacy: only ever populated on jobs completed before the with-email/
+    # without-email split shipped (migrations/0013_split_with_website_by_email.sql).
     if job["with_web_csv"] and job["with_website"] > 0:
         await conn.execute(
             """
@@ -39,6 +42,40 @@ async def index_business_job_files(conn: asyncpg.Connection, *, job_id) -> None:
             org_id, job["user_id"], job["id"],
             f"{job['industry']} — {job['state']} (With Website)",
             job["with_web_csv"], job["with_website"], job["emails_found"],
+            job["state"], job["industry"],
+        )
+
+    with_website_no_email = job["with_website"] - job["emails_found"]
+
+    if job["with_web_email_csv"] and job["emails_found"] > 0:
+        await conn.execute(
+            """
+            INSERT INTO lead_files
+                (organization_id, user_id, source_type, source_id, file_category,
+                 display_name, storage_path, file_type, file_size,
+                 record_count, website_count, email_count, state, industry_or_category)
+            VALUES ($1,$2,'business',$3,'business_with_website_email',$4,$5,'csv',NULL,$6,$6,$6,$7,$8)
+            ON CONFLICT (source_type, source_id, file_category) DO NOTHING
+            """,
+            org_id, job["user_id"], job["id"],
+            f"{job['industry']} — {job['state']} (With Email)",
+            job["with_web_email_csv"], job["emails_found"],
+            job["state"], job["industry"],
+        )
+
+    if job["with_web_no_email_csv"] and with_website_no_email > 0:
+        await conn.execute(
+            """
+            INSERT INTO lead_files
+                (organization_id, user_id, source_type, source_id, file_category,
+                 display_name, storage_path, file_type, file_size,
+                 record_count, website_count, email_count, state, industry_or_category)
+            VALUES ($1,$2,'business',$3,'business_with_website_no_email',$4,$5,'csv',NULL,$6,$6,0,$7,$8)
+            ON CONFLICT (source_type, source_id, file_category) DO NOTHING
+            """,
+            org_id, job["user_id"], job["id"],
+            f"{job['industry']} — {job['state']} (Without Email)",
+            job["with_web_no_email_csv"], with_website_no_email,
             job["state"], job["industry"],
         )
 
