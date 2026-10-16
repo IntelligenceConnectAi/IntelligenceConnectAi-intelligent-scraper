@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import { CONSUMER_STACK_META, BUSINESS_STACK_META } from "../lib/filterStackMeta";
+import { CONSUMER_STACK_META, BUSINESS_STACK_META, STACK_ORDER } from "../lib/filterStackMeta";
+import { CONSUMER_AUDIENCE, BUSINESS_AUDIENCE } from "../lib/audienceProfiles";
 
 function fmt(iso) {
   if (!iso) return "—";
@@ -9,9 +10,13 @@ function fmt(iso) {
 
 function TargetingSummary({ targeting }) {
   if (!targeting) return null;
-  const stackMeta = targeting.target_audience === "Consumers" ? CONSUMER_STACK_META
-                   : targeting.target_audience === "Businesses" ? BUSINESS_STACK_META : null;
+  const isConsumer = targeting.target_audience === "Consumers";
+  const isBusiness = targeting.target_audience === "Businesses";
+  const stackMeta = isConsumer ? CONSUMER_STACK_META : isBusiness ? BUSINESS_STACK_META : null;
   const stackKeys = targeting.filter_stacks || [];
+  const nicheId = targeting.business_type?.id;
+  const audienceSource = isConsumer ? CONSUMER_AUDIENCE : isBusiness ? BUSINESS_AUDIENCE : null;
+  const audienceProfile = nicheId && audienceSource ? audienceSource[nicheId] : null;
 
   const field = (label, value) => (
     <div>
@@ -31,9 +36,38 @@ function TargetingSummary({ targeting }) {
         ))}
         {field("Who They Want to Target", targeting.target_audience === "Consumers" ? "People / Households"
           : targeting.target_audience === "Businesses" ? "Businesses" : null)}
-        {field("Filter Stack(s) Selected", stackKeys.length
-          ? stackKeys.map(k => stackMeta?.[k]?.name || k).join(", ") : null)}
       </div>
+
+      {stackKeys.length > 0 && (
+        <div className="mt-4 pt-4" style={{ borderTop: "1px solid var(--border)" }}>
+          <p className="text-xs uppercase tracking-wide mb-1.5" style={{ color: "var(--text-3)", letterSpacing: "0.04em" }}>
+            Filter Stack(s) Selected ({stackKeys.length})
+          </p>
+          {audienceProfile?.ideal && (
+            <p className="text-xs mb-2.5" style={{ color: "var(--text-2)" }}>
+              <span style={{ color: "var(--text-3)" }}>Ideal customer: </span>{audienceProfile.ideal}
+            </p>
+          )}
+          <div className="grid gap-2.5 sm:grid-cols-3">
+            {STACK_ORDER.filter(k => stackKeys.includes(k)).map(k => {
+              const meta = stackMeta?.[k];
+              const criteria = audienceProfile?.[k];
+              return (
+                <div key={k} className="rounded-lg p-3" style={{ background: "var(--surface-soft)", border: "1px solid var(--border)" }}>
+                  <p className="text-xs font-semibold" style={{ color: "var(--people-primary)" }}>
+                    {meta?.tag || k}{meta?.rec && " ★"}
+                  </p>
+                  <p className="text-sm font-semibold mt-0.5" style={{ color: "var(--text)" }}>{meta?.name || k}</p>
+                  {meta?.sub && <p className="text-xs mt-0.5" style={{ color: "var(--text-3)" }}>{meta.sub}</p>}
+                  <p className="text-xs mt-2 whitespace-pre-line" style={{ color: "var(--text-2)" }}>
+                    {criteria || "No preset criteria on file (custom/other business type)."}
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {targeting.cities?.length > 0 && (
         <div className="mt-4">
